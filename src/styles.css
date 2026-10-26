@@ -17,6 +17,7 @@
   --color-desk-soft: #2c2722;
   --font-serif: "Newsreader", Georgia, "Iowan Old Style", "Palatino Linotype", serif;
   --font-sans: "Outfit", "Avenir Next", "Segoe UI", sans-serif;
+  --font-log: "Monaspace Argon", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   --radius-ui: 0.6rem;
 }
 
@@ -43,6 +44,15 @@
     background: #efd3c8;
     color: var(--color-ink);
   }
+}
+
+.opening-log {
+  font-family: var(--font-log);
+  font-weight: 430;
+  font-size: 0.84rem;
+  line-height: 1.65;
+  font-variation-settings: "wght" 430, "wdth" 100, "slnt" 0;
+  font-feature-settings: "calt" 1, "liga" 1;
 }
 
 .page-anchor {

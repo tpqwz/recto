@@ -129,6 +129,12 @@ export async function folioFromPdf(
       }
       warning = err instanceof Error ? err.message : "Some picture pages could not be read.";
     }
+  } else if (settings.kind === "vision") {
+    warning =
+      settings.pictures === "off"
+        ? "Pictures of pages is off, so the vision model was not used."
+        : "Every page already had text, so the vision model was not used.";
+    onStatus?.(warning);
   }
   let title = titleFromName(filename);
   let author = "";

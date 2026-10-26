@@ -24,7 +24,9 @@ async function readKind(
   const lines: Line[] = [];
   let failed = 0;
   for (const page of pages) {
-    onStatus?.(`Reading the picture of page ${page.n} of ${total}`);
+    onStatus?.(
+      kind === "vision" ? `Vision model, page ${page.n} of ${total}` : `PP-OCR, page ${page.n} of ${total}`,
+    );
     try {
       const canvas = await page.draw();
       const found =
@@ -49,9 +51,15 @@ export async function readPicturePages(
 ): Promise<{ lines: Line[]; warning?: string }> {
   let use: OcrKind = kind;
   let warning: string | undefined;
-  if (kind === "vision" && !(await graphicsChip())) {
-    use = "pp";
-    warning = NO_CHIP;
+  if (kind === "vision") {
+    onStatus?.("Checking whether this browser can run the vision model");
+    if (!(await graphicsChip())) {
+      use = "pp";
+      warning = NO_CHIP;
+      onStatus?.(NO_CHIP);
+    } else {
+      onStatus?.("Starting the vision model");
+    }
   }
   try {
     if (use === "vision") {
@@ -63,6 +71,7 @@ export async function readPicturePages(
       } catch (err) {
         warning = err instanceof Error && err.message ? err.message : VISION_FALLBACK;
         if (!warning.includes("PP-OCR")) warning = VISION_FALLBACK;
+        onStatus?.(warning);
         const read = await readKind("pp", pages, total, onStatus);
         if (!read.lines.length && read.failed) throw new Error("PP-OCR could not read the pictures of those pages.");
         return { lines: read.lines, warning };

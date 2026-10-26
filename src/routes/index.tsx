@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { BookOpen, ChevronDown, Download, Menu, Search, X } from "lucide-react";
 import book from "@/data/book.json";
 import { previewPathPrefix } from "@/lib/preview-path-prefix";
@@ -50,6 +50,22 @@ const lucis = book as Folio;
 const chaptersOf = (folio: Folio) => folio.chapters;
 const tocOf = (folio: Folio) => folio.toc as TocNode[];
 
+function pinViewport() {
+  if (window.scrollY !== 0 || document.documentElement.scrollTop !== 0 || document.body.scrollTop !== 0) {
+    window.scrollTo(0, 0);
+  }
+}
+
+function scrollInReader(id: string) {
+  const node = document.getElementById(id);
+  const scroller = document.querySelector("main");
+  if (!node || !(scroller instanceof HTMLElement)) return null;
+  const top = node.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
+  scroller.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+  pinViewport();
+  return node;
+}
+
 function ownerKey(chapterId: string, index: number, slot: string) {
   return `${chapterId}:${index}:${slot}`;
 }
@@ -94,6 +110,9 @@ function Desk() {
   const [active, setActive] = useState("title-page");
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState("");
+  const [log, setLog] = useState<string[]>([]);
+  const [logOpen, setLogOpen] = useState(false);
+  const logBox = useRef<HTMLDivElement>(null);
   const [note, setNote] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
@@ -111,6 +130,20 @@ function Desk() {
   const [wheelChapter, setWheelChapter] = useState<string | null>(null);
   const chapters = chaptersOf(folio);
   const toc = tocOf(folio);
+
+  function begin(message: string) {
+    setLog([message]);
+    setBusy(message);
+  }
+
+  function report(message: string) {
+    if (!message) {
+      setBusy("");
+      return;
+    }
+    setBusy(message);
+    setLog((prev) => (prev[prev.length - 1] === message ? prev : [...prev, message]));
+  }
   const owners = useMemo(() => buildOwners(chapters), [chapters]);
   const lastPage = useMemo(() => {
     let max = 1;
@@ -160,6 +193,28 @@ function Desk() {
   }, [folio.title, lucisEdition]);
 
   useEffect(() => {
+    const pin = () => pinViewport();
+    window.addEventListener("scroll", pin, { passive: true });
+    const onLink = (event: MouseEvent) => {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const link = (event.target as Element | null)?.closest?.("a[href^='#']");
+      if (!link) return;
+      const id = decodeURIComponent((link.getAttribute("href") || "").slice(1));
+      if (!id || !document.getElementById(id)) return;
+      event.preventDefault();
+      const node = scrollInReader(id);
+      setOpen(false);
+      setWheel(false);
+      if (node?.dataset.spy) setActive(id);
+    };
+    document.addEventListener("click", onLink);
+    return () => {
+      window.removeEventListener("scroll", pin);
+      document.removeEventListener("click", onLink);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!import.meta.env.PROD || !("serviceWorker" in navigator)) return;
     const prefix = previewPathPrefix(window.location.hostname, window.location.pathname) ?? "";
     navigator.serviceWorker.register(`${prefix}/sw.js`, { scope: `${prefix}/`, updateViaCache: "none" }).catch(() => {});
@@ -191,8 +246,7 @@ function Desk() {
   }, [folio]);
 
   function go(id: string) {
-    const node = document.getElementById(id);
-    node?.scrollIntoView({ behavior: "smooth", block: "start" });
+    const node = scrollInReader(id);
     setOpen(false);
     setWheel(false);
     if (node?.dataset.spy) setActive(id);
@@ -226,48 +280,36 @@ function Desk() {
   }, [folio.title, folio.author, folio.origin]);
 
   useEffect(() => {
-    const onSelection = () => {
-      if (editing) return;
+    let frame = 0;
+    let timer = 0;
+    let pointerDown = false;
+    let shown: SelectionPick | null = null;
+    const read = (): SelectionPick | null => {
+      if (editing) return null;
       const sel = window.getSelection();
-      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
-        setPick(null);
-        return;
-      }
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
       const range = sel.getRangeAt(0);
-      const node = range.commonAncestorContainer;
-      const el = node instanceof Element ? node : node.parentElement;
-      if (!el?.closest("article.folio") || el.closest("[data-editing]") || el.closest("[data-selection-menu]")) {
-        setPick(null);
-        return;
-      }
+      const blockOf = (node: Node) => {
+        const el = node instanceof Element ? node : node.parentElement;
+        return el?.closest<HTMLElement>("article.folio [data-block]") ?? null;
+      };
+      const start = blockOf(range.startContainer);
+      const end = blockOf(range.endContainer);
+      const host = start || end;
+      if (!host || host.closest("[data-editing]") || host.closest("[data-selection-menu]")) return null;
       const text = sel.toString().replace(/\s+/g, " ").trim();
-      if (!text) {
-        setPick(null);
-        return;
-      }
-      const article = el.closest("article.folio");
-      const blocks = [...(article?.querySelectorAll<HTMLElement>("[data-block]") || [])].filter((item) => {
-        try {
-          return range.intersectsNode(item);
-        } catch {
-          return false;
-        }
-      });
-      if (!blocks.length) {
-        const host = el.closest<HTMLElement>("[data-block]");
-        if (host) blocks.push(host);
-      }
-      if (!blocks.length) return;
-      const chapterId = blocks[0].dataset.chapter || "";
-      const same = blocks.filter((item) => item.dataset.chapter === chapterId);
-      const indexes = same.map((item) => Number(item.dataset.block)).filter((n) => Number.isInteger(n));
-      if (!indexes.length) return;
+      if (!text) return null;
+      const chapterId = (start || host).dataset.chapter || "";
+      const indexes = [start, end]
+        .filter((item): item is HTMLElement => !!item && item.dataset.chapter === chapterId)
+        .map((item) => Number(item.dataset.block))
+        .filter((n) => Number.isInteger(n));
+      if (!indexes.length) return null;
       const rect = range.getBoundingClientRect();
-      const srcRaw = Number(same[0].dataset.src);
-      setMenuNote("");
-      setPick({
+      const srcRaw = Number((start || host).dataset.src);
+      return {
         text,
-        page: same[0].dataset.page || null,
+        page: (start || host).dataset.page || null,
         src: Number.isInteger(srcRaw) && srcRaw > 0 ? srcRaw : null,
         top: rect.top,
         bottom: rect.bottom,
@@ -275,10 +317,57 @@ function Desk() {
         chapterId,
         from: Math.min(...indexes),
         to: Math.max(...indexes),
-      });
+      };
+    };
+    const unchanged = (next: SelectionPick | null) =>
+      shown === next ||
+      (!!shown &&
+        !!next &&
+        shown.text === next.text &&
+        shown.chapterId === next.chapterId &&
+        shown.from === next.from &&
+        shown.to === next.to &&
+        shown.top === next.top &&
+        shown.left === next.left);
+    const commit = () => {
+      frame = 0;
+      const next = read();
+      if (unchanged(next)) return;
+      if (shown?.text !== next?.text) setMenuNote("");
+      shown = next;
+      setPick(next);
+    };
+    const schedule = () => {
+      if (pointerDown || frame) return;
+      frame = requestAnimationFrame(commit);
+    };
+    const onSelection = () => {
+      if (pointerDown) return;
+      schedule();
+    };
+    const onDown = () => {
+      pointerDown = true;
+      window.clearTimeout(timer);
+      if (frame) cancelAnimationFrame(frame);
+      frame = 0;
+    };
+    const onUp = () => {
+      pointerDown = false;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(schedule, 60);
     };
     document.addEventListener("selectionchange", onSelection);
-    return () => document.removeEventListener("selectionchange", onSelection);
+    document.addEventListener("pointerdown", onDown);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onUp);
+    return () => {
+      window.clearTimeout(timer);
+      if (frame) cancelAnimationFrame(frame);
+      document.removeEventListener("selectionchange", onSelection);
+      document.removeEventListener("pointerdown", onDown);
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onUp);
+    };
   }, [editing]);
 
   async function copyPick() {
@@ -316,7 +405,7 @@ function Desk() {
   async function openOriginal() {
     if (!pick || !folio.origin) return;
     const chosen = pick;
-    setBusy("Opening the original");
+    begin("Opening the original");
     setNote("");
     try {
       const record = (await loadSource(bookKey(folio))) || source;
@@ -402,7 +491,7 @@ function Desk() {
       showLucis();
       return;
     }
-    setBusy("Opening the edition");
+    begin("Opening the edition");
     setNote("");
     try {
       const res = await fetch(`/samples/${id}.json`);
@@ -434,11 +523,11 @@ function Desk() {
     const file = input.files?.[0];
     input.value = "";
     if (!file) return;
-    setBusy("Opening the book");
+    begin("Opening the book");
     setNote("");
     try {
       const bytes = await file.arrayBuffer();
-      const next = await folioFromFile(bytes.slice(0), file.name, setBusy, loadSettings());
+      const next = await folioFromFile(bytes.slice(0), file.name, report, loadSettings());
       const kind = next.origin?.kind || detectKind(file.name, new Uint8Array(bytes));
       next.origin = { name: file.name, kind };
       let shelfNote = "";
@@ -496,7 +585,7 @@ function Desk() {
   }
 
   async function openKept(entry: ShelfEntry) {
-    setBusy("Opening the book");
+    begin("Opening the book");
     setNote("");
     try {
       const next = await loadFolio(entry.id);
@@ -592,15 +681,22 @@ function Desk() {
   }, [wheel]);
 
   useEffect(() => {
-    if (!pending && !wheel) return;
+    if (!logOpen) return;
+    const node = logBox.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [log, logOpen]);
+
+  useEffect(() => {
+    if (!pending && !wheel && !logOpen) return;
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      if (wheel) setWheel(false);
+      if (logOpen) setLogOpen(false);
+      else if (wheel) setWheel(false);
       else setPending(null);
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [pending, wheel]);
+  }, [pending, wheel, logOpen]);
 
   const filterText = filter.trim().toLowerCase();
   const visibleToc = toc.filter((entry) => {
@@ -699,23 +795,29 @@ function Desk() {
           </ol>
         </nav>
         <div className="border-t border-desk-line px-4 py-3">
-          <label className="flex min-h-11 cursor-pointer items-center justify-center rounded-ui border border-desk-line bg-desk-soft px-3 py-2 text-center text-sm text-desk-fg">
-            {busy ? (
-              busy
-            ) : (
+          {busy ? (
+            <button
+              type="button"
+              aria-expanded={logOpen}
+              onClick={() => setLogOpen((openNow) => !openNow)}
+              className="flex min-h-11 w-full items-center justify-center rounded-ui border border-desk-line bg-desk-soft px-3 py-2 text-center text-sm text-desk-fg"
+            >
+              <span className="line-clamp-3">{busy}</span>
+            </button>
+          ) : (
+            <label className="flex min-h-11 cursor-pointer items-center justify-center rounded-ui border border-desk-line bg-desk-soft px-3 py-2 text-center text-sm text-desk-fg">
               <span className="flex flex-col items-center leading-tight">
                 <span>Open a book</span>
                 <span className="text-xs text-desk-muted">PDF or DjVu</span>
               </span>
-            )}
-            <input
-              type="file"
-              accept="application/pdf,.pdf,.djvu,.djv,image/vnd.djvu,image/x-djvu"
-              className="sr-only"
-              onChange={onBook}
-              disabled={!!busy}
-            />
-          </label>
+              <input
+                type="file"
+                accept="application/pdf,.pdf,.djvu,.djv,image/vnd.djvu,image/x-djvu"
+                className="sr-only"
+                onChange={onBook}
+              />
+            </label>
+          )}
           {note ? <p className="mt-2 text-xs leading-snug text-desk-muted">{note}</p> : null}
           <div className="mt-2">
             <p className="px-0.5 text-xs tracking-wide text-desk-muted uppercase">Shelf</p>
@@ -1003,6 +1105,28 @@ function Desk() {
           onShare={() => void sharePick()}
           onOriginal={folio.origin ? () => void openOriginal() : undefined}
         />
+      ) : null}
+      {logOpen ? (
+        <div className="fixed inset-x-0 bottom-0 z-50 flex h-[min(50dvh,32rem)] flex-col border-t border-desk-line bg-desk text-desk-fg">
+          <div className="flex shrink-0 items-center justify-between px-4 py-1 md:px-6">
+            <p className="text-xs tracking-wide text-desk-muted uppercase">Opening</p>
+            <button type="button" className="h-11 px-2 text-sm text-desk-muted" onClick={() => setLogOpen(false)}>
+              Close
+            </button>
+          </div>
+          <div ref={logBox} className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 md:px-6">
+            <ol className="opening-log">
+              {log.map((line, index) => (
+                <li
+                  key={`${index}-${line}`}
+                  className={"py-0.5 text-sm leading-relaxed " + (index === log.length - 1 ? "text-cream" : "text-desk-muted")}
+                >
+                  {line}
+                </li>
+              ))}
+            </ol>
+          </div>
+        </div>
       ) : null}
       {pending ? (
         <div className="fixed inset-0 z-[80] grid place-items-center bg-desk/50 px-4" onClick={() => setPending(null)}>
@@ -1339,10 +1463,15 @@ function SettingsSheet({
         >
           <span className="text-sm">Use a vision model instead</span>
           <span className="mt-1 block text-xs leading-relaxed text-muted">
-            Off unless you turn this on. The first picture page downloads a few hundred megabytes. It runs only where a
-            graphics chip is available. If it cannot, those pages are read with PP-OCR.
+            Off unless you turn this on. The first picture page downloads a few hundred megabytes. It runs only through WebGPU. If
+            that is not available, those pages are read with PP-OCR.
           </span>
         </button>
+        <p className="mt-3 text-xs leading-relaxed text-muted">
+          WebGPU is already on in current Chrome, Edge, and Brave on Windows and macOS, when hardware acceleration is on. On Linux
+          the same browsers usually need WebGPU switched on, and there WebGPU is Vulkan. Firefox has WebGPU on Windows and on Apple
+          silicon, and not on Linux. Brave can also hide the graphics chip. The desk cannot turn any of this on.
+        </p>
       </div>
     </div>
   );
