@@ -1,0 +1,136 @@
+/* Recto desk, kept: paper, ink, cinnabar, Newsreader. Do not restyle this surface. */
+@import "tailwindcss";
+@import "./fonts/faces.css";
+
+@theme {
+  --color-paper: #f3eee4;
+  --color-paper-2: #faf6ef;
+  --color-ink: #1c1915;
+  --color-muted: #6e645b;
+  --color-rule: #e2d5c4;
+  --color-cinnabar: #8c2f22;
+  --color-cream: #fff8f3;
+  --color-desk: #221e1a;
+  --color-desk-fg: #f3eee4;
+  --color-desk-muted: #b6a898;
+  --color-desk-line: #3c352e;
+  --color-desk-soft: #2c2722;
+  --font-serif: "Newsreader", Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  --font-sans: "Outfit", "Avenir Next", "Segoe UI", sans-serif;
+  --radius-ui: 0.6rem;
+}
+
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  html,
+  body {
+    height: 100%;
+    overflow: hidden;
+  }
+  html {
+    background: var(--color-desk);
+  }
+  body {
+    margin: 0;
+    background: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+  }
+  ::selection {
+    background: #efd3c8;
+    color: var(--color-ink);
+  }
+}
+
+.page-anchor {
+  scroll-margin-top: 5.5rem;
+}
+
+.folio-wheel {
+  scroll-snap-type: y mandatory;
+  mask-image: linear-gradient(to bottom, transparent, #000 16%, #000 84%, transparent);
+}
+
+.folio p {
+  margin: 0;
+  text-indent: 1.15em;
+  font-family: var(--font-serif);
+  font-size: 1.125rem;
+  line-height: 1.55;
+}
+.folio p.noindent,
+.folio p.extract,
+.folio p.verse,
+.folio p.center,
+.folio p.item,
+.folio p.tocline {
+  text-indent: 0;
+}
+.folio p.extract {
+  margin-top: 1.15em;
+}
+.folio p.item {
+  margin: 0.35em 0 0.35em 1.15em;
+}
+.folio p.verse {
+  margin: 0.15em 0;
+  text-align: center;
+}
+.folio p.center {
+  margin: 0.55em 0;
+  text-align: center;
+  color: var(--color-muted);
+}
+.folio h1,
+.folio h2 {
+  font-family: var(--font-serif);
+  font-weight: 560;
+  text-indent: 0;
+  scroll-margin-top: 5.5rem;
+}
+.folio h1 {
+  margin: 0 0 0.8em;
+  text-align: center;
+  font-size: 2rem;
+  line-height: 1.2;
+  letter-spacing: -0.015em;
+}
+.folio h2 {
+  margin: 1.6em 0 0.45em;
+  font-style: italic;
+  font-size: 1.35rem;
+  line-height: 1.3;
+}
+.folio .page-label {
+  display: block;
+  margin: 1.4rem 0 0.35rem;
+  text-align: center;
+  font-family: var(--font-sans);
+  font-size: 0.68rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+  text-indent: 0;
+}
+.folio table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0 1.5rem;
+  font-size: 0.92rem;
+  line-height: 1.4;
+}
+.folio th,
+.folio td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.4rem 0.45rem;
+  border-bottom: 1px solid var(--color-rule);
+}
+.folio th {
+  font-style: italic;
+  font-weight: 520;
+  color: var(--color-muted);
+}
