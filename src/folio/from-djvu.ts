@@ -1,8 +1,9 @@
 import { previewPathPrefix } from "@/lib/preview-path-prefix";
-import { assembleFolio, cluster, type Folio, type Line, type OutlineItem } from "./assemble";
+import { cluster, type Folio, type Line, type OutlineItem } from "./assemble";
+import { composeFolio } from "./compose";
 import { jpegFromRgba } from "./cover";
-import { loadLexicon } from "./repair";
 import { DEFAULT_SETTINGS, type DeskSettings } from "./settings";
+import { checkpoint } from "./job";
 
 const NO_TEXT = "No text layer in that DjVu. Recto reads the hidden text, not a picture of the page.";
 const NO_TEXT_PICTURES = "No text layer in that DjVu. Picture reading is for a PDF.";
@@ -94,12 +95,13 @@ export async function folioFromDjvu(
     await worker.createDocument(copy, { memoryLimit: Math.min(512 * 1024 * 1024, Math.max(64 * 1024 * 1024, copy.byteLength * 8)) });
     const bundled = (await worker.run(worker.doc.isBundled())) as boolean;
     if (!bundled) throw new Error("That DjVu is split into separate page files. Open the single bundled file.");
-    const lexiconPromise = loadLexicon(previewPathPrefix(window.location.hostname, window.location.pathname) ?? "");
     const quantity = (await worker.run(worker.doc.getPagesQuantity())) as number;
+    onStatus?.(`${quantity} ${quantity === 1 ? "page" : "pages"}`);
     const sizes = (await worker.run(worker.doc.getPagesSizes())) as Array<{ width: number; height: number }>;
     const lines: Line[] = [];
     const batch = 6;
     for (let start = 1; start <= quantity; start += batch) {
+      checkpoint();
       onStatus?.(`Reading page ${start} of ${quantity}`);
       const nums: number[] = [];
       const tasks: unknown[] = [];
@@ -142,28 +144,31 @@ export async function folioFromDjvu(
           });
         });
       }
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
-    onStatus?.("Reading the contents");
-    const [outline, lexicon] = await Promise.all([readOutline(worker, quantity), lexiconPromise]);
-    const folio = assembleFolio(lines, {
-      title: titleFromName(filename),
-      subtitle: "From a DjVu",
-      sourceName: filename,
-      outline,
-      lexicon,
-      emptyMessage: settings.pictures === "empty" ? NO_TEXT_PICTURES : NO_TEXT,
-      onStatus,
-    });
-    folio.origin = { name: filename, kind: "djvu" };
+    const outline = await readOutline(worker, quantity);
+    const listed = outline.filter((item) => item.page || item.children.some((child) => child.page)).length;
+    onStatus?.(listed >= 2 ? `The file lists ${listed} chapters` : "The file has no contents list");
+    let cover: string | undefined;
     try {
       const image = (await worker.run(worker.doc.getPage(1).getImageData())) as { width: number; height: number; buffer: ArrayBuffer };
       const pixels = new Uint8ClampedArray(image.width * image.height * 4);
       pixels.set(new Uint8ClampedArray(image.buffer));
-      const cover = jpegFromRgba(image.width, image.height, pixels);
-      if (cover) folio.cover = cover;
+      cover = jpegFromRgba(image.width, image.height, pixels);
     } catch {
       /* the text still converts when the first page will not draw */
     }
+    const folio = await composeFolio(lines, {
+      title: titleFromName(filename),
+      subtitle: "From a DjVu",
+      sourceName: filename,
+      outline,
+      lexiconPrefix: previewPathPrefix(window.location.hostname, window.location.pathname) ?? "",
+      cover,
+      emptyMessage: settings.pictures === "empty" ? NO_TEXT_PICTURES : NO_TEXT,
+      onStatus,
+    });
+    folio.origin = { name: filename, kind: "djvu" };
     return folio;
   } finally {
     worker.terminate();

@@ -1,6 +1,7 @@
 import { strToU8, zipSync } from "fflate";
 import { detectPrinted, type PrintedPages } from "./pages.ts";
 import { mergeHyphen, repairText, type WordList } from "./repair.ts";
+import { shapeLines, suppressTwins, untwinLine } from "./cases.ts";
 
 export type PageRun = { p: string };
 export type Run = string | number | PageRun;
@@ -35,7 +36,19 @@ export type Folio = {
   cover?: string;
 };
 export type OutlineItem = { label: string; page: number | null; children: OutlineItem[] };
-export type Line = { text: string; y: number; x0: number; x1: number; h: number; page: number; pageH: number; pageW: number };
+export type Line = {
+  text: string;
+  y: number;
+  x0: number;
+  x1: number;
+  h: number;
+  page: number;
+  pageH: number;
+  pageW: number;
+  cells?: { text: string; x0: number; x1: number }[];
+  table?: { headers: string[]; rows: string[][] };
+  role?: "note";
+};
 
 export function runPage(run: Run): number | string | null {
   if (typeof run === "number") return run;
@@ -51,7 +64,7 @@ function esc(s: string) {
     .replace(/"/g, "&" + "quot;");
 }
 
-export function cluster(items: { str: string; transform: number[]; width?: number; height?: number }[]): { text: string; y: number; x0: number; x1: number; h: number }[] {
+export function cluster(items: { str: string; transform: number[]; width?: number; height?: number }[]): { text: string; y: number; x0: number; x1: number; h: number; cells?: { text: string; x0: number; x1: number }[] }[] {
   const its = items
     .filter((it) => it.str && String(it.str).trim())
     .map((it) => ({
@@ -74,21 +87,50 @@ export function cluster(items: { str: string; transform: number[]; width?: numbe
       placed = true;
       break;
     }
-    if (!placed) lines.push({ y: it.y, items: [it] });
+    if (!placed) {
+      const twin = lines.some(
+        (ln) =>
+          Math.abs(ln.y - it.y) <= 3.2 &&
+          ln.items.some((o) => {
+            const overlap = Math.min(o.x + o.w, it.x + it.w) - Math.max(o.x, it.x);
+            return overlap > 2 && o.str.replace(/\s+/g, "") === it.str.replace(/\s+/g, "");
+          }),
+      );
+      if (!twin) lines.push({ y: it.y, items: [it] });
+    }
   }
   return lines
     .map((ln) => {
       ln.items.sort((a, b) => a.x - b.x);
       let text = "";
+      let cellText = "";
+      let cellX0 = ln.items[0].x;
+      const cells: { text: string; x0: number; x1: number }[] = [];
       let prev: (typeof its)[number] | null = null;
+      const pushCell = (x1: number) => {
+        const piece = cellText.replace(/[ \t]+/g, " ").trim();
+        if (piece) cells.push({ text: piece, x0: cellX0, x1 });
+        cellText = "";
+      };
       for (const it of ln.items) {
+        let wide = false;
         if (prev) {
           const gap = it.x - (prev.x + prev.w);
-          if (gap > Math.max(1.15, Math.max(prev.h, it.h, 8) * 0.12)) text += " ";
+          wide = gap > Math.max(14, Math.max(prev.h, it.h, 8) * 2.4);
+          if (wide) {
+            pushCell(prev.x + prev.w);
+            cellX0 = it.x;
+          }
+          if (gap > Math.max(1.15, Math.max(prev.h, it.h, 8) * 0.12)) {
+            text += " ";
+            if (!wide && cellText) cellText += " ";
+          }
         }
         text += it.str;
+        cellText += it.str;
         prev = it;
       }
+      if (prev) pushCell(prev.x + prev.w);
       const last = ln.items[ln.items.length - 1];
       return {
         text: text.replace(/[ \t]+/g, " ").trim(),
@@ -96,6 +138,7 @@ export function cluster(items: { str: string; transform: number[]; width?: numbe
         x0: ln.items[0].x,
         x1: last.x + last.w,
         h: Math.max(...ln.items.map((i) => i.h || 0)),
+        cells: cells.length >= 2 ? cells : undefined,
       };
     })
     .filter((ln) => ln.text.replace(/[^A-Za-z0-9]/g, "").length > 0)
@@ -113,7 +156,7 @@ function joinParagraph(group: Line[], hyphens: { n: number }, printed: PrintedPa
   let buf = "";
   let page = group[0].page;
   const flush = () => {
-    const t = lexicon ? repairText(buf, lexicon) : buf.replace(/[ \t]+/g, " ").trim();
+    const t = lexicon && !(group.length === 1 && headingKind(group[0].text)) ? repairText(buf, lexicon) : buf.replace(/[ \t]+/g, " ").trim();
     if (t) runs.push(t);
     buf = "";
   };
@@ -171,8 +214,70 @@ function normalizeOutline(items: OutlineItem[]) {
   return kept.filter((item) => item.page);
 }
 
-const CONTENTS_HEAD = /^(?:the\s+)?(?:table\s+of\s+)?contents\.?$/i;
+const CONTENTS_HEAD = /^(?:the\s+)?(?:table\s+of\s+)?contents\b|^(?:list\s+of\s+)?chapters\b/i;
 const CONTENTS_ENTRY = /^(.{2,90}?)(?:\s*[.\u00b7\u2026_]{2,}\s*|\s{2,})([0-9]{1,4}|[ivxlcdm]{1,8})\s*$/i;
+const PAGE_TOKEN = /^([0-9]{1,4}|[ivxlcdm]{1,8})$/i;
+
+/** A contents row: a title and a page, with or without dot leaders. A doubled row counts once. */
+export function contentsEntry(line: { text: string; cells?: { text: string }[] }): { title: string; token: string } | null {
+  const cells = line.cells?.map((cell) => cell.text.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const pair = contentsPair(cells);
+  if (pair) return pair;
+  const text = untwinLine(line.text).replace(/\s+/g, " ").trim();
+  if (!text || text.length > 160) return null;
+  const dotted = CONTENTS_ENTRY.exec(text);
+  if (dotted && /[A-Za-z]/.test(dotted[1])) {
+    const title = dotted[1].replace(/[.\s]+$/g, "").trim();
+    if (title.length > 1) return { title, token: dotted[2] };
+  }
+  const loose = /^(?:\d{1,3}[.)]\s+)?([A-Za-z][^.]{2,110}?)\s+([0-9]{1,4}|[ivxlcdm]{1,8})$/i.exec(text);
+  if (loose && /[A-Za-z]/.test(loose[1]) && !/[.?!]$/.test(loose[1])) return { title: loose[1].trim(), token: loose[2] };
+  return null;
+}
+
+function contentsPair(cells: string[] | undefined): { title: string; token: string } | null {
+  if (!cells) return null;
+  const usable = cells.length === 4 && cells[0] === cells[2] && cells[1] === cells[3] ? cells.slice(0, 2) : cells;
+  if (usable.length !== 2 || !PAGE_TOKEN.test(usable[1]) || !/[A-Za-z]/.test(usable[0]) || usable[0].length > 90) return null;
+  const title = usable[0].replace(/[.\s]+$/g, "").trim();
+  if (title.length < 2 || /[.?!]$/.test(title)) return null;
+  return { title, token: usable[1] };
+}
+
+/** Every title and page on a line. One line sometimes holds several, or the same one twice. */
+function allEntries(line: Line): { title: string; token: string }[] {
+  const one = contentsEntry(line);
+  if (one) return [one];
+  const text = untwinLine(line.text).replace(/\s+/g, " ").trim();
+  if (!text || text.length > 600) return [];
+  const found: { title: string; token: string }[] = [];
+  const pattern = /([A-Za-z][A-Za-z0-9'’,:\-() ]{2,68}?)\s+(?:[.\u00b7…_]{2,}\s*)?(\d{1,4})\b/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    const title = match[1].replace(/[.\s]+$/g, "").trim();
+    if (title.length < 3 || /[.?!]$/.test(title)) continue;
+    found.push({ title, token: match[2] });
+  }
+  if (found.length < 2) return [];
+  const covered = found.reduce((sum, entry) => sum + entry.title.length + entry.token.length, 0);
+  if (covered < text.replace(/\s/g, "").length * 0.45) return [];
+  return found;
+}
+
+function contentsPage(ordered: Line[]): Line | null {
+  const byPage = new Map<number, Line[]>();
+  for (const line of ordered) {
+    if (line.page > 25) break;
+    const list = byPage.get(line.page);
+    if (list) list.push(line);
+    else byPage.set(line.page, [line]);
+  }
+  for (const lines of byPage.values()) {
+    const hits = lines.filter((line) => contentsEntry(line));
+    if (hits.length >= 4) return hits[0];
+  }
+  return null;
+}
 
 function fileForLabel(printed: PrintedPages, token: string, maxPage: number) {
   const want = /^\d+$/.test(token) ? String(Number(token)) : token.toLowerCase();
@@ -183,53 +288,203 @@ function fileForLabel(printed: PrintedPages, token: string, maxPage: number) {
   return null;
 }
 
-/** A printed contents page, when the file itself has no outline. */
-export function outlineFromContents(lines: Line[], printed: PrintedPages): OutlineItem[] {
-  const ordered = [...lines].sort((a, b) => a.page - b.page || b.y - a.y);
-  const head = ordered.find((ln) => ln.page <= 30 && CONTENTS_HEAD.test(ln.text.trim()));
-  if (!head) return [];
-  const maxPage = ordered.reduce((n, ln) => Math.max(n, ln.page), 1);
-  const items: OutlineItem[] = [];
-  let misses = 0;
-  for (const ln of ordered) {
-    if (ln.page < head.page || ln.page > head.page + 6) continue;
-    if (ln.page === head.page && ln.y >= head.y) continue;
-    const text = ln.text.trim();
-    if (!text || CONTENTS_HEAD.test(text)) continue;
-    const found = CONTENTS_ENTRY.exec(text);
-    const title = found?.[1].replace(/[.\s]+$/g, "").trim();
-    const token = found?.[2];
-    const page = title && token && /[A-Za-z]/.test(title) ? fileForLabel(printed, token, maxPage) : null;
-    if (!page || page <= head.page) {
-      if (items.length) misses++;
-      if (items.length >= 3 && misses >= 3) break;
+/** A printed contents list. A list in the front of the book wins over an index at the back. A title the word list does not recognize is a broken contents line, not a chapter. */
+function endsWithPage(text: string) {
+  return /(?:^|\s)(?:[0-9]{1,4}|[ivxlcdm]{1,8})\s*$/i.test(text.trim());
+}
+
+/**
+ * A contents title often breaks onto the next, more indented line, and only that
+ * line carries the page. Those pieces are one entry. A new title is not.
+ */
+function stitchContents(lines: Line[]): { text: string; lines: Line[] }[] {
+  const groups: { text: string; lines: Line[] }[] = [];
+  for (const line of lines) {
+    const text = line.text.replace(/\s+/g, " ").trim();
+    if (!text || CONTENTS_HEAD.test(text) || !/[A-Za-z]{3}/.test(text)) continue;
+    const prev = groups[groups.length - 1];
+    const last = prev?.lines[prev.lines.length - 1];
+    const same = !!last && last.page === line.page;
+    const indented = !!prev && same && !endsWithPage(prev.text) && line.x0 >= last.x0 + 6;
+    const tail =
+      !!prev &&
+      same &&
+      !endsWithPage(prev.text) &&
+      endsWithPage(text) &&
+      text.split(/\s+/).length <= 6 &&
+      line.x0 + 8 >= last.x0;
+    if (prev && (indented || tail)) {
+      prev.text = `${prev.text} ${text}`.replace(/\s+/g, " ").trim();
+      prev.lines.push(line);
       continue;
     }
-    misses = 0;
+    groups.push({ text, lines: [line] });
+  }
+  return groups;
+}
+
+function contentsOutline(lines: Line[], printed: PrintedPages, lexicon: WordList | null): { items: OutlineItem[]; drop: Set<Line> } {
+  const empty = { items: [] as OutlineItem[], drop: new Set<Line>() };
+  const ordered = [...lines].sort((a, b) => a.page - b.page || b.y - a.y);
+  const maxPage = ordered.reduce((n, line) => Math.max(n, line.page), 1);
+  type Hit = { line: Line; title: string; page: number; file: number };
+  const hits: Hit[] = [];
+  const head = ordered.find((line) => line.page <= 40 && CONTENTS_HEAD.test(line.text.trim()));
+  const span = head ? { start: head.page, end: head.page + 14 } : null;
+  const inSpan = (line: Line) => !!span && line.page >= span.start && line.page <= span.end;
+  const stitched = span ? stitchContents(ordered.filter(inSpan)) : [];
+  const chapterSeen = stitched.filter((group) => /^chapter\s+\d+\b/i.test(group.text)).length;
+  const chapterKept = stitched.filter((group) => /^chapter\s+\d+\b/i.test(group.text) && endsWithPage(group.text)).length;
+  if (span && chapterSeen >= 4 && chapterKept < chapterSeen - 1) {
+    const drop = new Set<Line>();
+    const byPage = new Map<number, Line[]>();
+    for (const line of ordered) {
+      if (!inSpan(line)) continue;
+      const list = byPage.get(line.page);
+      if (list) list.push(line);
+      else byPage.set(line.page, [line]);
+    }
+    for (let page = span.start; page <= span.end; page++) {
+      const list = byPage.get(page) || [];
+      if (!list.length) continue;
+      const entries = list.filter((line) => contentsEntry(line) || CONTENTS_HEAD.test(line.text.trim())).length;
+      const prose = list.filter((line) => /[a-z]{4}/.test(line.text) && line.text.trim().length > 60).length;
+      const opened = list.some((line) => {
+        const text = line.text.trim();
+        return line.h >= 14 && /^(?:foreword|preface|prologue|introduction|part\s+[ivxlcdm\d]|appendix\b|chapter\s+)/i.test(text);
+      });
+      if (opened && page !== span.start) break;
+      if (entries >= 3 || (page <= span.start + 5 && prose < 2 && list.length >= 8)) {
+        for (const line of list) drop.add(line);
+        continue;
+      }
+      if (opened || (page !== span.start && prose >= 2)) break;
+      if (entries >= 1) {
+        for (const line of list) drop.add(line);
+        continue;
+      }
+      break;
+    }
+    return { items: [], drop };
+  }
+  const consider = (line: Line, text: string) => {
+    for (const found of allEntries({ ...line, text })) {
+      const page = fileForLabel(printed, found.token, maxPage);
+      if (!page || page === line.page) continue;
+      if (lexicon && !knownTitle(found.title, lexicon)) continue;
+      hits.push({ line, title: found.title.slice(0, 180), page, file: line.page });
+    }
+  };
+  for (const group of stitched) consider(group.lines[0], group.text);
+  for (const line of ordered) {
+    if (inSpan(line)) continue;
+    consider(line, line.text);
+  }
+  const runs: Hit[][] = [];
+  for (let i = 0; i < hits.length; i++) {
+    const run: Hit[] = [];
+    let last = 0;
+    for (let j = i; j < hits.length && hits[j].file <= hits[i].file + 12; j++) {
+      if (hits[j].page < last) continue;
+      if (run.some((item) => item.title === hits[j].title)) continue;
+      run.push(hits[j]);
+      last = hits[j].page;
+    }
+    const pages = new Set(run.map((item) => item.page));
+    if (run.length >= 3 && pages.size >= 2) runs.push(run);
+  }
+  if (!runs.length) return empty;
+  const front = runs.filter((run) => run[0].file <= Math.max(30, maxPage * 0.35));
+  const pool = front.length ? front : runs;
+  const best = pool.reduce((a, b) => (b.length > a.length ? b : a));
+  const drop = new Set(best.map((item) => item.line));
+  const files = new Set(best.map((item) => item.file));
+  for (const line of ordered) {
+    if (!files.has(line.page)) continue;
+    const text = line.text.trim();
+    if (CONTENTS_HEAD.test(text) || /^index$/i.test(text)) drop.add(line);
+  }
+  return {
+    items: best.slice(0, 80).map((item) => ({ label: item.title, page: item.page, children: [] })),
+    drop,
+  };
+}
+
+function normTitle(text: string) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function titleLike(text: string) {
+  const title = normTitle(text);
+  if (title.length < 4 || title.length > 72) return false;
+  if (/[.?!]["']?$/.test(title)) return false;
+  if (!/[A-Za-z]{3}/.test(title)) return false;
+  if (/^\d+$/.test(title)) return false;
+  return (title.match(/ /g) || []).length <= 12;
+}
+
+/**
+ * A contents list of titles, with no page numbers. A title counts only when the
+ * same line begins a later page. A numbered contents list never comes here.
+ */
+function titleOutline(lines: Line[]): { items: OutlineItem[]; drop: Set<Line> } {
+  const ordered = [...lines].sort((a, b) => a.page - b.page || b.y - a.y);
+  const empty = { items: [] as OutlineItem[], drop: new Set<Line>() };
+  const byPage = new Map<number, Line[]>();
+  for (const line of ordered) {
+    if (line.page > 20) break;
+    const list = byPage.get(line.page);
+    if (list) list.push(line);
+    else byPage.set(line.page, [line]);
+  }
+  let best: Line[] = [];
+  let bestPage = 0;
+  for (const [page, list] of byPage) {
+    const titles = list.filter((line) => titleLike(line.text));
+    if (titles.length < 5 || titles.length < list.length * 0.45) continue;
+    if (titles.length > best.length) {
+      best = titles;
+      bestPage = page;
+    }
+  }
+  if (!best.length) return empty;
+  const seen = new Set<string>();
+  const titles: { key: string; label: string }[] = [];
+  for (const line of best) {
+    const label = normTitle(line.text);
+    const key = label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    titles.push({ key, label });
+  }
+  const items: OutlineItem[] = [];
+  for (const title of titles) {
+    const hit = ordered.find((line) => line.page > bestPage && normTitle(line.text).toLowerCase() === title.key);
+    if (!hit) continue;
     const prev = items[items.length - 1];
-    if (prev && page < (prev.page || 0)) continue;
-    if (items.some((item) => item.label === title)) continue;
-    items.push({ label: title!.slice(0, 180), page, children: [] });
-    if (items.length >= 80) break;
+    if (prev && hit.page < (prev.page || 0)) continue;
+    items.push({ label: title.label.slice(0, 180), page: hit.page, children: [] });
   }
   const pages = new Set(items.map((item) => item.page));
-  return items.length >= 3 && pages.size >= 2 ? items : [];
+  if (items.length < 4 || pages.size < 2 || items.length < titles.length * 0.5) return empty;
+  return { items, drop: new Set(best) };
 }
 
 /** Lines of a printed contents list, so they are not left in the reading text. */
 function printedContentsLines(lines: Line[]) {
   const ordered = [...lines].sort((a, b) => a.page - b.page || b.y - a.y);
   const head = ordered.find((ln) => ln.page <= 30 && CONTENTS_HEAD.test(ln.text.trim()));
-  if (!head) return new Set<Line>();
-  const drop = new Set<Line>([head]);
+  const start = head || contentsPage(ordered);
+  if (!start) return new Set<Line>();
+  const drop = new Set<Line>([start]);
   let kept = 0;
   let misses = 0;
   for (const ln of ordered) {
-    if (ln.page < head.page || ln.page > head.page + 6) continue;
-    if (ln === head || (ln.page === head.page && ln.y >= head.y)) continue;
+    if (ln.page < start.page || ln.page > start.page + 6) continue;
+    if (ln === start || (ln.page === start.page && ln.y >= start.y)) continue;
     const text = ln.text.trim();
     if (!text) continue;
-    if (CONTENTS_HEAD.test(text) || CONTENTS_ENTRY.test(text)) {
+    if (CONTENTS_HEAD.test(text) || contentsEntry(ln)) {
       drop.add(ln);
       kept++;
       misses = 0;
@@ -252,7 +507,7 @@ function blockText(block: Block) {
 
 function isPrintedContents(text: string) {
   const line = text.replace(/\s+/g, " ").trim();
-  return CONTENTS_HEAD.test(line) || CONTENTS_ENTRY.test(line);
+  return CONTENTS_HEAD.test(line) || !!contentsEntry({ text: line });
 }
 
 /** A linked contents page, as in the sample editions, in place of the printed list. */
@@ -316,6 +571,11 @@ function chapterHtml(blocks: Block[], hrefFor?: (id: string) => string) {
       const label = b.n ? `${b.n}. ${b.s || ""}` : b.s || "";
       const page = b.page != null && b.page !== "" ? ` <span>${esc(String(b.page))}</span>` : "";
       parts.push(`<p class="tocline${b.kind === "section" ? " section" : ""}"><a href="${esc(href)}">${esc(label)}</a>${page}</p>`);
+    } else if (b.t === "table") {
+      mark(b.page);
+      const head = (b.headers || []).map((cell) => `<th>${esc(cell)}</th>`).join("");
+      const body = (b.rows || []).map((row) => `<tr>${row.map((cell) => `<td>${esc(cell)}</td>`).join("")}</tr>`).join("");
+      parts.push(`<table>${head ? `<thead><tr>${head}</tr></thead>` : ""}<tbody>${body}</tbody></table>`);
     } else if (b.t === "p") {
       mark(b.page);
       const inner = (b.runs || [])
@@ -329,7 +589,7 @@ function chapterHtml(blocks: Block[], hrefFor?: (id: string) => string) {
           return `<span epub:type="pagebreak" id="page-${esc(key)}" role="doc-pagebreak" aria-label="${esc(key)}" title="${esc(key)}"></span>`;
         })
         .join("");
-      parts.push(`<p>${inner}</p>`);
+      parts.push(`<p${b.kind === "note" ? ' class="note"' : ""}>${inner}</p>`);
     }
   }
   return { html: parts.join("\n"), pages };
@@ -479,7 +739,14 @@ ${manifest.join("\n")}
   return zipSync(files, { level: 6 });
 }
 
-type Para = { group: Line[]; runs: Run[]; h: number };
+type Para = { group: Line[]; runs: Run[]; h: number; table?: { headers: string[]; rows: string[][] }; kind?: "note" };
+
+function bodyBlock(p: Para, printed: PrintedPages): Block {
+  const page = printed.label(p.group[0].page);
+  const src = p.group[0].page;
+  if (p.table) return { t: "table", headers: p.table.headers, rows: p.table.rows, page, src };
+  return { t: "p", runs: p.runs, page, src, kind: p.kind };
+}
 
 function pushChapter(chapters: Folio["chapters"], label: string, page: number | string | null, src?: number) {
   const id = `c${String(chapters.length + 1).padStart(2, "0")}`;
@@ -505,7 +772,7 @@ function withOutline(paras: Para[], outline: OutlineItem[], title: string, print
   const front = paras.filter((p) => p.group[0].page < first);
   if (front.length) {
     const ch = pushChapter(chapters, "Front matter", printed.label(front[0].group[0].page), front[0].group[0].page);
-    for (const p of front) ch.blocks.push({ t: "p", runs: p.runs, page: printed.label(p.group[0].page), src: p.group[0].page });
+    for (const p of front) ch.blocks.push(bodyBlock(p, printed));
   }
   outline.forEach((item, index) => {
     const start = item.page || 1;
@@ -522,33 +789,406 @@ function withOutline(paras: Para[], outline: OutlineItem[], title: string, print
         const id = `${ch.id}-${slug(child.label)}`;
         ch.blocks.push({ t: "h2", id, s: child.label, page: printed.label(page), src: page, section: true });
       }
-      ch.blocks.push({ t: "p", runs: p.runs, page: printed.label(page), src: page });
+      const said = p.runs
+        .filter((run): run is string => typeof run === "string")
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (said.toLowerCase() === ch.title.toLowerCase()) continue;
+      ch.blocks.push(bodyBlock(p, printed));
     }
   });
   if (!chapters.length) pushChapter(chapters, title, printed.label(paras[0]?.group[0].page ?? 1), paras[0]?.group[0].page);
   return chapters;
 }
 
+function knownTitle(title: string, lexicon: WordList) {
+  const words = title.toLowerCase().match(/[a-z]{3,}/g) || [];
+  if (!words.length) return false;
+  let known = 0;
+  for (const word of words) {
+    const ok = lexicon.has(word) || (word.length > 4 && word.endsWith("s") && lexicon.has(word.slice(0, -1)));
+    if (!ok && word.length >= 8) return false;
+    if (ok) known++;
+  }
+  return known >= 1 && known * 4 >= words.length * 3;
+}
+
+const CHAPTER_LABEL =
+  /^(?:chapter|book)\s+(?:\d{1,2}|[ivxlcdm]{1,6}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\s*[:.]?\s*$/i;
+const SECTION_LABEL = /^(?:[A-Z]|[ivxlcdm]{1,5})\.\s+\S/;
+
+function chapterLabel(text: string) {
+  return CHAPTER_LABEL.test(text.replace(/\s+/g, " ").trim());
+}
+
+function headingKind(text: string): "chapter" | "section" | "title" | null {
+  const title = text.replace(/\s+/g, " ").trim().replace(/^[^A-Za-z0-9]+/, "");
+  if (title.length < 2 || title.length > 90 || /[.!]["']?$/.test(title) || CONTENTS_HEAD.test(title)) return null;
+  if (chapterLabel(title)) return "chapter";
+  if (/^part\s+(?:[ivxlcdm]{1,6}|\d{1,2})\s*[:.]?\s*$/i.test(title)) return "chapter";
+  if (/^appendix\s+(?:\d{1,2}|[ivxlcdm]{1,6})\s*[:.]?\s*$/i.test(title)) return "chapter";
+  if (/^(?:chapter|book)\s+\S/i.test(title)) return null;
+  if (SECTION_LABEL.test(title) && !/^[A-Z]\.\s*[A-Z]\./.test(title)) return "section";
+  const words = title.split(/\s+/);
+  if (words.length > 14) return null;
+  const small = new Set(["a", "an", "and", "but", "or", "nor", "of", "the", "in", "on", "at", "to", "for", "by", "as", "from", "with", "into", "over", "upon"]);
+  const titled = words.every((word, index) => (index > 0 && small.has(word.toLowerCase())) || /^[A-Z0-9][A-Za-z0-9'’.,:?/\u2013\u2014-]*$/.test(word));
+  return titled ? "title" : null;
+}
+
+function allCapsLine(text: string) {
+  return /[A-Z]/.test(text) && !/[a-z]/.test(text);
+}
+
+function headingWords(text: string) {
+  return text.split(/\s+/).filter((word) => /[A-Za-z]{2}/.test(word)).length;
+}
+
+function softenHeading(text: string) {
+  const title = text.replace(/\s+/g, " ").trim().replace(/^[^A-Za-z0-9]+/, "").replace(/\bLHE\b/g, "THE");
+  const section = SECTION_LABEL.test(title);
+  if (/[a-z]/.test(title) && !section) return title;
+  const small = new Set(["a", "an", "and", "of", "the", "in", "on", "to", "for", "by"]);
+  const roman = /^(?:i{1,3}|iv|vi{0,3}|ix|x|xi{0,3}|xiv|xv|xvi{0,3}|xix|xx)$/i;
+  return title
+    .toLowerCase()
+    .split(" ")
+    .map((word, index, all) => {
+      if (roman.test(word)) return word.toUpperCase();
+      const afterColon = index > 0 && /:$/.test(all[index - 1]);
+      if (!section && index > 0 && !afterColon && small.has(word)) return word;
+      return word.replace(/(^|[-'])([a-z])/g, (_full, boundary: string, letter: string) =>
+        boundary === "'" && letter === "s" ? "'s" : `${boundary}${letter.toUpperCase()}`,
+      );
+    })
+    .join(" ");
+}
+
+/** Stacked heading lines. A small word that merely continues the previous line stays small, except A, An, and The. */
+function softenStack(lines: string[]) {
+  const small = new Set(["of", "and", "to", "for", "in", "on", "by", "as", "from", "with", "or"]);
+  return lines
+    .map((raw, index) => {
+      const text = softenHeading(raw);
+      if (index === 0) return text;
+      return text.replace(/^[A-Za-z'’]+/, (word) => (small.has(word.toLowerCase()) ? word.toLowerCase() : word));
+    })
+    .join(" ");
+}
+
+function centeredLine(line: Line) {
+  const width = line.x1 - line.x0;
+  if (width < 4 || line.pageW < 40) return false;
+  const mid = (line.x0 + line.x1) / 2;
+  return Math.abs(mid - line.pageW / 2) < Math.min(36, line.pageW * 0.1) && width < line.pageW * 0.82;
+}
+
+function romanMarker(text: string) {
+  const token = text.replace(/\s+/g, " ").trim().replace(/\.$/, "");
+  if (!token || token.length > 5) return null;
+  if (/^[ivxlcdm]+$/i.test(token)) return token.toLowerCase();
+  if (/^i[uv]+$/i.test(token)) return token.toLowerCase().replace(/u/g, "i");
+  return null;
+}
+
+function ornamentText(text: string) {
+  return /^[\d.]{1,3}$/.test(text.trim());
+}
+
+function setApart(line: Line, bodyH: number) {
+  const text = line.text.replace(/\s+/g, " ").trim();
+  if (!text || text.length > 90) return false;
+  if (centeredLine(line) && (ornamentText(text) || romanMarker(text))) return true;
+  if (headingKind(text)) return true;
+  if (/^(?:and|or|of|with|from)\b/i.test(text) && text.split(/\s+/).length <= 6 && line.h > bodyH * 1.08 && text.length < 42) return true;
+  return line.h > bodyH * 1.28 && text.length < 80 && !/[.?!]$/.test(text);
+}
+
+/** A contents page whose titles the word list does not recognize. Dot leaders often leave that kind of scrap. */
+function contentsDamaged(lines: Line[], lexicon: WordList) {
+  const byPage = new Map<number, { n: number; ok: number }>();
+  let head = 0;
+  for (const line of lines) {
+    if (line.page > 40) continue;
+    if (!head && CONTENTS_HEAD.test(line.text.trim()) && line.page <= 40) head = line.page;
+  }
+  if (!head) return false;
+  for (const line of lines) {
+    if (line.page < head || line.page > head + 12) continue;
+    const found = allEntries(line);
+    if (!found.length) continue;
+    const stat = byPage.get(line.page) || { n: 0, ok: 0 };
+    for (const entry of found) {
+      stat.n++;
+      if (knownTitle(entry.title, lexicon)) stat.ok++;
+    }
+    byPage.set(line.page, stat);
+  }
+  return [...byPage.values()].some((stat) => stat.n >= 8 && stat.ok * 2 < stat.n);
+}
+
+/** Pages of a printed contents list, including lines the dot leaders made unreadable. */
+function scrapContents(lines: Line[]) {
+  const byPage = new Map<number, Line[]>();
+  for (const line of lines) {
+    const list = byPage.get(line.page);
+    if (list) list.push(line);
+    else byPage.set(line.page, [line]);
+  }
+  let head = 0;
+  for (const page of [...byPage.keys()].sort((a, b) => a - b)) {
+    if (page > 40) break;
+    const list = byPage.get(page) || [];
+    if (!list.some((line) => CONTENTS_HEAD.test(line.text.trim()))) continue;
+    let entries = 0;
+    for (let n = page; n <= page + 2; n++) entries += (byPage.get(n) || []).filter((line) => contentsEntry(line)).length;
+    if (entries >= 4) {
+      head = page;
+      break;
+    }
+  }
+  const drop = new Set<Line>();
+  if (!head) return drop;
+  for (let page = head; page <= head + 14; page++) {
+    const list = byPage.get(page) || [];
+    if (!list.length) continue;
+    if (list.some((line) => chapterLabel(line.text))) break;
+    const long = list.filter((line) => line.text.trim().length > 80 && /[a-z]{3}/.test(line.text)).length;
+    if (page !== head && long >= 3) break;
+    const entries = list.filter((line) => contentsEntry(line) || CONTENTS_HEAD.test(line.text.trim())).length;
+    const like = page === head || (long <= 2 && list.length >= 6 && (entries >= 1 || list.length >= 12));
+    if (!like) break;
+    for (const line of list) drop.add(line);
+  }
+  return drop;
+}
+
 function withHeadings(paras: Para[], title: string, bodyH: number, printed: PrintedPages) {
-  const headingAt = new Set<number>();
-  paras.forEach((p, i) => {
-    const text = p.runs.filter((r): r is string => typeof r === "string").join(" ");
-    if (p.group.length === 1 && p.h > bodyH * 1.28 && text.length > 2 && text.length < 80 && !/[,:;]$/.test(text)) headingAt.add(i);
-  });
-  if (headingAt.size > 60) headingAt.clear();
+  const textOf = (p: Para) => p.runs.filter((r): r is string => typeof r === "string").join(" ").replace(/\s+/g, " ").trim();
+  const gaps: number[] = [];
+  for (let i = 1; i < paras.length; i++) {
+    const prev = paras[i - 1];
+    const here = paras[i];
+    if (prev.group[0].page !== here.group[0].page || prev.table || here.table) continue;
+    const gap = prev.group[prev.group.length - 1].y - here.group[0].y;
+    if (gap > 0 && gap < bodyH * 4) gaps.push(gap);
+  }
+  const lead = median(gaps) || bodyH * 1.2;
+  const front = new Set(["introduction", "acknowledgments", "acknowledgement", "preface", "foreword", "prologue", "epilogue", "bibliography", "index", "glossary", "notes"]);
+  const noiseHeading = (value: string, h: number) => {
+    if (/\bsee\b/i.test(value) && value.split(/\s+/).length <= 12) return true;
+    if (/^\d{2,4}\s/.test(value)) return true;
+    if (/[A-Za-z]-$/.test(value) && h < bodyH * 1.2) return true;
+    return /^\d{1,3}\.\s+[A-Z]/.test(value) && h < bodyH * 1.2 && value.length > 32;
+  };
+  const display = (p: Para, index: number) => {
+    if (p.table || p.kind === "note") return false;
+    const text = textOf(p);
+    if (/^\s*[.\u00b7\u2022]/.test(text)) return false;
+    const kind = headingKind(text);
+    if (noiseHeading(text, p.h)) return false;
+    if (/^[A-Z]\.\s*[A-Z]\./.test(text) || /^[A-Z]\.\s+[A-Z][a-z]+(?:\s+[A-Z][a-z.]+){0,3}$/.test(text)) return false;
+    if (kind === "chapter" || kind === "section") return true;
+    if (kind !== "title" || p.group.length !== 1) return false;
+    const line = p.group[0];
+    if (/^[A-Z]\.\s*[A-Z]\./.test(text) || /\bq\.\s*\d|\ba\.\s*\d|\bobj\./i.test(text)) return false;
+    if (front.has(text.toLowerCase()) && centeredLine(line)) return true;
+    const titleCase = /[a-z]/.test(text);
+    const smallCaps = p.h > 0 && p.h < bodyH * 0.85;
+    const large = p.h > bodyH * 1.28;
+    const standing = p.h > bodyH * 1.15 && p.h < bodyH * 2.8;
+    const words = text.split(/\s+/).length;
+    if (titleCase && words === 1 && text.length < 4) return false;
+    if (titleCase && p.h < bodyH * 0.95 && !front.has(text.toLowerCase())) return false;
+    if (/\s\.\s/.test(text) || (p.h < bodyH * 1.25 && /\d[A-Za-z]|[A-Za-z]\d/.test(text))) return false;
+    if (titleCase && (centeredLine(line) || large || standing)) return true;
+    if (!titleCase && centeredLine(line) && smallCaps) {
+      if (words < 2 && !front.has(text.toLowerCase())) return false;
+      const taller = (q?: Para) => !!q && !q.table && q.h > p.h * 1.2;
+      return taller(paras[index - 1]) || taller(paras[index + 1]);
+    }
+    return false;
+  };
+  const hangs = (value: string) => /(?:[:;,]\s*|['’]s\s*|\b(?:of|and|the|a|an|to|for|in|on|with|or|from|by)\s*)$/i.test(value);
+  const continuesHeading = (head: Para, next: Para) => {
+    if (next.table || next.kind === "note" || next.group.length !== 1 || head.group.length !== 1) return false;
+    if (next.group[0].page !== head.group[0].page) return false;
+    const above = textOf(head);
+    const below = textOf(next);
+    if (/^\s*[.\u00b7\u2022]/.test(below)) return false;
+    if (/[.!]["']?$/.test(above) || /[.!]["']?$/.test(below)) return false;
+    if (headingKind(below) === "chapter" || SECTION_LABEL.test(below)) return false;
+    if (front.has(below.replace(/[:.]+$/g, "").trim().toLowerCase())) return false;
+    const kind = headingKind(below);
+    const caps = allCapsLine(below) && below.length < 60;
+    const shortTail = /^(?:and|or|of|the|a|an|to|for|with|from)\b/i.test(below) && below.split(/\s+/).length <= 6;
+    const question = /\?\s*$/.test(above);
+    if (kind !== "title" && kind !== "section" && !caps && !((hangs(above) || shortTail || question) && below.length < 80)) return false;
+    const dh = Math.abs(next.h - head.h);
+    if (dh > 2 && dh > head.h * 0.15) return false;
+    if (next.h < bodyH * 1.05) return false;
+    if (Math.abs(head.group[0].x0 - next.group[0].x0) > 14) return false;
+    const gap = head.group[head.group.length - 1].y - next.group[0].y;
+    if (gap <= 0 || gap > Math.max(head.h, next.h) * 2.1) return false;
+    const width = next.group[0].x1 - next.group[0].x0;
+    const headWidth = head.group[0].x1 - head.group[0].x0;
+    if (!question && width > next.group[0].pageW * 0.72) return false;
+    return hangs(above) || question || shortTail || width < headWidth * 0.72;
+  };
+  const takeTail = (index: number) => {
+    const extra: number[] = [];
+    let anchor = paras[index];
+    for (let j = index + 1; j < paras.length; j++) {
+      const next = paras[j];
+      if (!continuesHeading(anchor, next)) break;
+      extra.push(j);
+      anchor = {
+        ...anchor,
+        h: next.h,
+        group: [{ ...anchor.group[0], y: next.group[next.group.length - 1].y }],
+      };
+    }
+    return extra;
+  };
   const chapters: Folio["chapters"] = [];
-  let current = headingAt.has(0) ? null : pushChapter(chapters, title, printed.label(paras[0]?.group[0].page ?? 1), paras[0]?.group[0].page);
+  const skip = new Set<number>();
+  const labeled = paras.some((p) => headingKind(textOf(p)) === "chapter");
+  const anyChapter = labeled || paras.some((p, index) => display(p, index) && p.h > bodyH * 1.28);
+  let current: Folio["chapters"][number] | null = null;
+  let sealed = false;
+  const open = (label: string, p: Para) => {
+    current = pushChapter(chapters, label, printed.label(p.group[0].page), p.group[0].page);
+  };
+  const section = (label: string, p: Para) => {
+    if (!current) open(anyChapter ? "Front matter" : title, p);
+    const id = `${current!.id}-${slug(label)}`;
+    current!.blocks.push({ t: "h2", id, s: label, page: printed.label(p.group[0].page), src: p.group[0].page, section: true });
+  };
   paras.forEach((p, i) => {
-    const text = p.runs.filter((r): r is string => typeof r === "string").join(" ");
-    const filePage = p.group[0].page;
-    if (headingAt.has(i)) {
-      current = pushChapter(chapters, text, printed.label(filePage), filePage);
+    if (skip.has(i)) return;
+    const text = textOf(p);
+    const line = p.group[0];
+    if (centeredLine(line) && ornamentText(text)) return;
+    const mark = centeredLine(line) ? romanMarker(text) : null;
+    if (mark && p.group.length === 1) {
+      const next = paras[i + 1];
+      if (next && headingKind(textOf(next)) === "title" && next.group[0].page === line.page) {
+        skip.add(i + 1);
+        section(`${mark}. ${softenHeading(textOf(next))}`, next);
+      }
       return;
     }
-    if (!current) current = pushChapter(chapters, title, printed.label(filePage), filePage);
-    current.blocks.push({ t: "p", runs: p.runs, page: printed.label(filePage), src: filePage });
+    if (headingKind(text) === "chapter") {
+      const follow: number[] = [];
+      for (let j = i + 1; j < paras.length; j++) {
+        const next = paras[j];
+        if (next.group[0].page !== line.page || next.table || next.kind === "note") break;
+        const nextText = textOf(next);
+        if (/^[A-Z]\.\s*[A-Z]\./.test(nextText) || /\bq\.\s*\d|\ba\.\s*\d/i.test(nextText)) break;
+        if (centeredLine(next.group[0]) && (ornamentText(nextText) || romanMarker(nextText))) {
+          follow.push(j);
+          continue;
+        }
+        const kind = headingKind(nextText);
+        const caps = allCapsLine(nextText) && nextText.length <= 48 && centeredLine(next.group[0]) && !/[.?!]$/.test(nextText);
+        if (caps && next.h < line.h * 0.75 && next.h < bodyH * 1.35) break;
+        if (kind === "chapter") break;
+        if (kind === "section" || kind === "title" || caps) {
+          follow.push(j);
+          continue;
+        }
+        break;
+      }
+      const titleAt = new Set<number>();
+      for (const j of follow) {
+        const piece = textOf(paras[j]);
+        if (ornamentText(piece) || romanMarker(piece)) continue;
+        const caps = allCapsLine(piece) && piece.length <= 48 && centeredLine(paras[j].group[0]);
+        if ((headingKind(piece) === "title" && allCapsLine(piece)) || caps) {
+          titleAt.add(j);
+          continue;
+        }
+        break;
+      }
+      let appendixAt: number | null = null;
+      if (/^appendix\b/i.test(text)) {
+        for (const j of follow) {
+          if (titleAt.has(j)) continue;
+          const piece = textOf(paras[j]);
+          if (ornamentText(piece) || romanMarker(piece)) continue;
+          if (headingKind(piece) === "title" && paras[j].h > bodyH * 1.12) appendixAt = j;
+          break;
+        }
+      }
+      const titleLines = [...titleAt];
+      if (appendixAt != null) titleLines.push(appendixAt);
+      const subtitle = titleLines.length ? softenStack(titleLines.map((j) => textOf(paras[j]))) : "";
+      open(subtitle ? `${softenHeading(text)}. ${subtitle}` : softenHeading(text), p);
+      for (const j of titleLines) skip.add(j);
+      let pending = "";
+      for (const j of follow) {
+        if (titleLines.includes(j) || skip.has(j)) continue;
+        skip.add(j);
+        const piece = textOf(paras[j]);
+        const marker = romanMarker(piece);
+        if (marker && paras[j].group.length === 1) {
+          pending = marker;
+          continue;
+        }
+        if (ornamentText(piece)) continue;
+        const extra = takeTail(j);
+        for (const k of extra) skip.add(k);
+        const whole = [piece, ...extra.map((k) => textOf(paras[k]))].join(" ");
+        const label = pending && headingKind(piece) === "title" ? `${pending}. ${softenHeading(whole)}` : softenHeading(whole);
+        pending = "";
+        section(label, paras[j]);
+      }
+      skip.add(i);
+      return;
+    }
+    const large = !labeled && p.group.length === 1 && p.h > bodyH * 1.28 && text.length > 2 && text.length < 80 && !/[,:;]$/.test(text);
+    if (large && headingKind(text) !== "section") {
+      open(softenHeading(text), p);
+      return;
+    }
+    if (display(p, i) && headingKind(text) !== "chapter") {
+      const bare = text.replace(/[:.]+$/g, "").trim().toLowerCase();
+      const back = /^(?:glossary|notes|index|bibliography)$/.test(bare);
+      if (sealed && !back) {
+        if (!current) open(anyChapter ? "Front matter" : title, p);
+        current!.blocks.push(bodyBlock(p, printed));
+        return;
+      }
+      const inFront = !current || current.title === "Front matter";
+      if (inFront && !front.has(bare) && headingKind(text) !== "section" && !/^appendix\b/i.test(text)) {
+        if (!current) open(anyChapter ? "Front matter" : title, p);
+        current!.blocks.push(bodyBlock(p, printed));
+        return;
+      }
+      if (back) sealed = true;
+      const extra = takeTail(i);
+      for (const j of extra) skip.add(j);
+      section(softenHeading([text, ...extra.map((j) => textOf(paras[j]))].join(" ")), p);
+      return;
+    }
+    if (!current) open(anyChapter ? "Front matter" : title, p);
+    current!.blocks.push(bodyBlock(p, printed));
   });
   if (!chapters.length) pushChapter(chapters, title, 1);
+  for (const chapter of chapters) {
+    const crowded = new Map<string, Block[]>();
+    for (const block of chapter.blocks) {
+      if (block.t !== "h2" || !block.s || SECTION_LABEL.test(block.s)) continue;
+      const key = String(block.src ?? "");
+      const list = crowded.get(key) || [];
+      list.push(block);
+      crowded.set(key, list);
+    }
+    const drop = new Set<Block>();
+    for (const list of crowded.values()) if (list.length > 4) for (const block of list) drop.add(block);
+    if (drop.size) chapter.blocks = chapter.blocks.filter((block) => !drop.has(block));
+  }
   return chapters;
 }
 
@@ -562,16 +1202,33 @@ export function assembleFolio(
     outline?: OutlineItem[];
     emptyMessage: string;
     lexicon?: WordList | null;
+    cover?: string;
+    skipEpub?: boolean;
     onStatus?: (s: string) => void;
   },
 ): Folio {
-  const printed = detectPrinted(rawLines);
+  const untwinned = suppressTwins(rawLines);
+  const source = untwinned.lines;
+  const printed = detectPrinted(source);
   const lexicon = options.lexicon || null;
-  const skipContents = printedContentsLines(rawLines);
+  const bookmark = normalizeOutline(options.outline || []);
+  const numbered = bookmark.length >= 2 ? { items: [] as OutlineItem[], drop: new Set<Line>() } : contentsOutline(source, printed, lexicon);
+  let damaged = "";
+  if (lexicon && contentsDamaged(source, lexicon)) {
+    const span = scrapContents(source);
+    const heads = source.filter((line) => !span.has(line) && chapterLabel(line.text)).length;
+    if (heads >= 3) {
+      numbered.items = [];
+      for (const line of span) numbered.drop.add(line);
+      damaged = "The printed contents could not be read, so the chapters follow the headings.";
+    }
+  }
+  const titled = bookmark.length >= 2 || numbered.items.length >= 2 ? { items: [] as OutlineItem[], drop: new Set<Line>() } : titleOutline(source);
+  const skipContents = printedContentsLines(source);
   let headers = 0;
   const kept: Line[] = [];
-  for (const ln of rawLines) {
-    if (skipContents.has(ln)) continue;
+  for (const ln of source) {
+    if (skipContents.has(ln) || numbered.drop.has(ln) || titled.drop.has(ln)) continue;
     const short = ln.text.length < 72;
     const header = ln.y > ln.pageH - 54 && short && (/\d/.test(ln.text) || ln.text.length < 40);
     const footer = ln.y < 36 && short;
@@ -582,32 +1239,73 @@ export function assembleFolio(
     kept.push(ln);
   }
   if (!kept.length) throw new Error(options.emptyMessage);
-  const bodyH = median(kept.map((ln) => ln.h));
-  const margin = median(kept.filter((ln) => ln.x1 - ln.x0 > 80).map((ln) => Math.round(ln.x0 / 2) * 2));
+  const shaped = shapeLines(kept);
+  if (untwinned.note) options.onStatus?.(untwinned.note);
+  if (shaped.note) options.onStatus?.(shaped.note);
+  const bodyH = median(shaped.lines.map((ln) => ln.h));
+  const margin = median(shaped.lines.filter((ln) => ln.x1 - ln.x0 > 80).map((ln) => Math.round(ln.x0 / 2) * 2));
+  const leads: number[] = [];
+  for (let i = 1; i < shaped.lines.length; i++) {
+    const prev = shaped.lines[i - 1];
+    const ln = shaped.lines[i];
+    if (prev.page !== ln.page || prev.table || ln.table || prev.role === "note" || ln.role === "note") continue;
+    const gap = prev.y - ln.y;
+    if (gap > 0 && gap < bodyH * 4) leads.push(gap);
+  }
+  const lead = median(leads) || bodyH * 1.2;
+  const breakGap = Math.max(lead * 1.45, lead + 4);
   const groups: Line[][] = [];
   let buf: Line[] = [];
   const flush = () => {
     if (buf.length) groups.push(buf);
     buf = [];
   };
-  for (const ln of kept) {
+  for (const ln of shaped.lines) {
+    if (ln.table || ln.role === "note") {
+      flush();
+      groups.push([ln]);
+      continue;
+    }
+    if (setApart(ln, bodyH)) {
+      flush();
+      groups.push([ln]);
+      continue;
+    }
     const prev = buf[buf.length - 1];
     const pageBreak = !!prev && prev.page !== ln.page;
     const gap = prev && !pageBreak ? prev.y - ln.y : 0;
     const prevEnded = !!prev && /[.?!]["']?$/.test(prev.text.trim()) && prev.x1 < prev.pageW * 0.78;
-    const indented = ln.x0 > margin + 14;
-    if (prev && !/[A-Za-z]-$/.test(prev.text) && (gap > Math.max(bodyH * 0.9, 14) || (indented && prevEnded) || (pageBreak && prevEnded))) flush();
+    const prevShort = !!prev && prev.x1 < prev.pageW * 0.8;
+    const indented = ln.x0 > margin + 8;
+    if (prev && !/[A-Za-z]-$/.test(prev.text) && (gap > breakGap || (indented && (prevEnded || prevShort)) || (pageBreak && prevEnded))) flush();
     buf.push(ln);
   }
   flush();
   const hyphens = { n: 0 };
   const paras = groups
-    .map((group) => ({ group, runs: joinParagraph(group, hyphens, printed, lexicon), h: group[0].h }))
-    .filter((p) => p.runs.some((r) => typeof r === "string" && r.replace(/[^A-Za-z]/g, "").length > 1));
+    .map((group) => {
+      if (group[0].table) return { group, runs: [] as Run[], h: group[0].h, table: group[0].table };
+      return {
+        group,
+        runs: joinParagraph(group, hyphens, printed, lexicon),
+        h: group[0].h,
+        kind: group[0].role === "note" ? ("note" as const) : undefined,
+      };
+    })
+    .filter((p) => p.table || p.runs.some((r) => typeof r === "string" && r.replace(/[^A-Za-z]/g, "").length > 1));
   if (!paras.length) throw new Error(options.emptyMessage);
-  const tops = normalizeOutline(options.outline || []);
-  const fromContents = tops.length >= 2 ? [] : outlineFromContents(rawLines, printed);
-  const chosen = tops.length >= 2 ? tops : fromContents;
+  const chosen = bookmark.length >= 2 ? bookmark : numbered.items.length >= 2 ? numbered.items : titled.items;
+  options.onStatus?.(
+    bookmark.length >= 2
+      ? `Contents from the file's own list, ${bookmark.length} chapters`
+      : numbered.items.length >= 2
+        ? `Contents from the titles and page numbers, ${numbered.items.length} chapters`
+        : titled.items.length >= 2
+          ? `Contents from the headings, ${titled.items.length} chapters`
+          : damaged || "No contents list. The chapters follow the headings.",
+  );
+  if (hyphens.n) options.onStatus?.(`Rejoined ${hyphens.n} ${hyphens.n === 1 ? "word" : "words"} split across a line`);
+  if (headers) options.onStatus?.(`Left out ${headers} running ${headers === 1 ? "head" : "heads"}`);
   const reading = chosen.length >= 2 ? withOutline(paras, chosen, options.title, printed) : withHeadings(paras, options.title, bodyH, printed);
   const chapters = presentContents(reading);
   const folio: Folio = {
@@ -618,9 +1316,14 @@ export function assembleFolio(
     toc: tocOf(chapters),
     chapters,
   };
-  options.onStatus?.("Making the EPUB");
-  folio.epubHref = epubBlob(folio, options.sourceName);
-  folio.epubName = `${options.title.replace(/[^\w.-]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "folio"}.epub`;
+  if (untwinned.note || shaped.note) folio.warning = [untwinned.note, shaped.note].filter(Boolean).join(" ");
+  options.onStatus?.(`${folio.stats.chapters} ${folio.stats.chapters === 1 ? "chapter" : "chapters"}`);
+  if (options.cover) folio.cover = options.cover;
+  if (!options.skipEpub) {
+    options.onStatus?.("Making the EPUB");
+    folio.epubHref = epubBlob(folio, options.sourceName);
+    folio.epubName = `${options.title.replace(/[^\w.-]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "folio"}.epub`;
+  }
   return folio;
 }
 

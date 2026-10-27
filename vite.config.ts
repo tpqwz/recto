@@ -1,4 +1,4 @@
-import { readdirSync } from "node:fs";
+import { appendFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Plugin } from "vite";
 import { defineConfig } from "vite";
@@ -61,6 +61,38 @@ function pgliteBootstrapPlugin(): Plugin {
  * and returns the 302 / completion HTML. Deployed apps do not use the popup
  * (full-page OAuth redirect), so `apply: "serve"` is enough.
  */
+function watchOpeningPlugin(): Plugin {
+  return {
+    name: "recto-watch",
+    apply: "serve",
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const pathOnly = (req.url ?? "").split("?", 1)[0] ?? "";
+        if (pathOnly !== "/__recto/watch") {
+          next();
+          return;
+        }
+        appendFileSync("/tmp/recto-watch.log", `hit ${req.method} ${pathOnly}\n`);
+        if ((req.method ?? "GET").toUpperCase() !== "POST") {
+          res.statusCode = 405;
+          res.end();
+          return;
+        }
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => {
+          chunks.push(chunk);
+          if (chunks.reduce((sum, part) => sum + part.length, 0) > 400_000) req.destroy();
+        });
+        req.on("end", () => {
+          appendFileSync("/tmp/recto-watch.log", Buffer.concat(chunks).toString("utf8") + "\n");
+          res.statusCode = 204;
+          res.end();
+        });
+      });
+    },
+  };
+}
+
 function authPopupPlugin(): Plugin {
   return {
     name: "app-builder:auth-popup",
@@ -159,6 +191,7 @@ export default defineConfig(({ command, isPreview }) => ({
   resolve: { tsconfigPaths: true },
   plugins: [
     pgliteBootstrapPlugin(),
+    watchOpeningPlugin(),
     // Before tanstackStart so /auth/popup never falls through to the SPA.
     authPopupPlugin(),
     // Dev-only /__app-env, read by scripts/check-auth-invariant.mjs.

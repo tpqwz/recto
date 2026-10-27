@@ -58,46 +58,121 @@ function openDb() {
   });
 }
 
-export async function keepSource(key: string, name: string, kind: OriginKind, bytes: ArrayBuffer) {
-  if (typeof indexedDB === "undefined") return;
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(new Uint8Array(bytes));
-  const db = await openDb();
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).put({ key, name, kind, bytes: copy }, key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-  db.close();
-}
+const PART_BYTES = 512 * 1024;
 
-export async function loadSource(key: string): Promise<Retained | null> {
-  if (typeof indexedDB === "undefined") return null;
-  const db = await openDb();
-  const row = await new Promise<Retained | undefined>((resolve, reject) => {
-    const tx = db.transaction(STORE, "readonly");
-    const request = tx.objectStore(STORE).get(key);
-    request.onsuccess = () => resolve(request.result as Retained | undefined);
+function idbGet(db: IDBDatabase, key: string) {
+  return new Promise<unknown>((resolve, reject) => {
+    const request = db.transaction(STORE, "readonly").objectStore(STORE).get(key);
+    request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
-  db.close();
-  if (!row?.bytes) return null;
-  const raw = row.bytes as ArrayBuffer | Uint8Array;
-  const bytes = raw instanceof Uint8Array ? raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) : raw;
-  return { ...row, bytes: bytes as ArrayBuffer };
 }
 
-export async function dropSource(key: string) {
-  if (typeof indexedDB === "undefined") return;
-  const db = await openDb();
-  await new Promise<void>((resolve, reject) => {
+function idbPut(db: IDBDatabase, key: string, value: unknown) {
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("The save was aborted."));
+  });
+}
+
+function idbDelete(db: IDBDatabase, key: string) {
+  return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
     tx.objectStore(STORE).delete(key);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+}
+
+export async function keepSource(key: string, name: string, kind: OriginKind, bytes: ArrayBuffer) {
+  if (typeof indexedDB === "undefined") return;
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(new Uint8Array(bytes));
+  const parts = Math.max(1, Math.ceil(copy.byteLength / PART_BYTES));
+  const db = await openDb();
+  try {
+    const existing = (await idbGet(db, key).catch(() => null)) as { parts?: number } | null;
+    const oldParts = existing && typeof existing.parts === "number" ? existing.parts : 0;
+    for (let i = 0; i < parts; i++) {
+      const slice = copy.subarray(i * PART_BYTES, Math.min(copy.byteLength, (i + 1) * PART_BYTES));
+      const chunk = new Uint8Array(slice.byteLength);
+      chunk.set(slice);
+      await idbPut(db, `${key}\u0000${i}`, chunk);
+    }
+    await idbPut(db, key, { key, name, kind, parts });
+    for (let i = parts; i < oldParts; i++) await idbDelete(db, `${key}\u0000${i}`);
+  } finally {
+    db.close();
+  }
+}
+
+export async function loadSource(key: string): Promise<Retained | null> {
+  if (typeof indexedDB === "undefined") return null;
+  const db = await openDb();
+  try {
+    const row = (await idbGet(db, key)) as (Retained & { parts?: number }) | undefined;
+    if (!row) return null;
+    if (typeof row.parts === "number") {
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      for (let i = 0; i < row.parts; i++) {
+        const chunk = (await idbGet(db, `${key}\u0000${i}`)) as Uint8Array | ArrayBuffer | undefined;
+        if (!chunk) return null;
+        const view = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        chunks.push(view);
+        total += view.byteLength;
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return { key: row.key, name: row.name, kind: row.kind, bytes: bytes.buffer as ArrayBuffer };
+    }
+    if (!row.bytes) return null;
+    const raw = row.bytes as ArrayBuffer | Uint8Array;
+    const bytes = raw instanceof Uint8Array ? raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) : raw;
+    return { ...row, bytes: bytes as ArrayBuffer };
+  } finally {
+    db.close();
+  }
+}
+
+export async function dropSource(key: string) {
+  if (typeof indexedDB === "undefined") return;
+  const db = await openDb();
+  try {
+    const row = (await idbGet(db, key).catch(() => null)) as { parts?: number } | null;
+    const parts = row && typeof row.parts === "number" ? row.parts : 0;
+    await idbDelete(db, key);
+    for (let i = 0; i < parts; i++) await idbDelete(db, `${key}\u0000${i}`);
+  } finally {
+    db.close();
+  }
+}
+
+/** Original files whose book is no longer on the shelf. */
+export async function dropOrphanSources(keep: string[]): Promise<number> {
+  if (typeof indexedDB === "undefined") return 0;
+  const db = await openDb();
+  const keys = await new Promise<string[]>((resolve, reject) => {
+    const request = db.transaction(STORE, "readonly").objectStore(STORE).getAllKeys();
+    request.onsuccess = () => resolve((request.result as IDBValidKey[]).map((key) => String(key)));
+    request.onerror = () => reject(request.error);
+  });
   db.close();
+  const held = new Set(keep);
+  let dropped = 0;
+  for (const key of keys) {
+    if (held.has(key)) continue;
+    await dropSource(key);
+    dropped += 1;
+  }
+  return dropped;
 }
 
 function plain(value: string) {

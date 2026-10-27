@@ -73,14 +73,19 @@
 }
 .folio p.noindent,
 .folio p.extract,
+.folio p.note,
 .folio p.verse,
 .folio p.center,
 .folio p.item,
 .folio p.tocline {
   text-indent: 0;
 }
-.folio p.extract {
+.folio p.extract,
+.folio p.note {
   margin-top: 1.15em;
+}
+.folio p.note {
+  font-size: 0.92rem;
 }
 .folio p.item {
   margin: 0.35em 0 0.35em 1.15em;

@@ -1,18 +1,30 @@
 import type { PDFDocumentProxy } from "pdfjs-dist/types/src/display/api";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { previewPathPrefix } from "@/lib/preview-path-prefix";
-import { assembleFolio, cluster, runPage, type Folio, type Line, type OutlineItem } from "./assemble";
+import { cluster, runPage, type Folio, type Line, type OutlineItem } from "./assemble";
+import { composeFolio } from "./compose";
 import { pictureScale } from "./picture";
+import { loadVision } from "./ocr-vision";
 import { readPicturePages } from "./pictures";
+import { needsPicture, scriptIn, scriptLabel } from "./script";
 import { jpegFromRgba } from "./cover";
 import { loadPdfjs, pdfAssetOptions } from "./pdf-local";
-import { loadLexicon } from "./repair";
+import { checkpoint } from "./job";
 import { DEFAULT_SETTINGS, type DeskSettings } from "./settings";
 
 export type { Block, Folio, OutlineItem, Run, TocNode } from "./assemble";
 export { runPage };
 
 const NO_TEXT = "No text layer in that PDF. Turn on picture reading in Settings, or open a PDF that already has text.";
+
+let lastBreath = 0;
+async function breathe() {
+  checkpoint();
+  const now = performance.now();
+  if (now - lastBreath < 48) return;
+  lastBreath = now;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 function assetPrefix() {
   if (typeof window === "undefined") return "";
@@ -79,22 +91,44 @@ export async function folioFromPdf(
   const pdfjs = await loadPdfjs();
   pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
   const doc = await pdfjs.getDocument({ data: new Uint8Array(data), ...pdfAssetOptions() }).promise;
-  const lexiconPromise = loadLexicon(assetPrefix());
+  onStatus?.(`${doc.numPages} ${doc.numPages === 1 ? "page" : "pages"}`);
+  if (settings.kind === "vision" && settings.pictures !== "off") {
+    onStatus?.("Starting the vision model");
+    void loadVision(onStatus).catch((err: unknown) => {
+      onStatus?.(err instanceof Error ? err.message : "The vision model did not start.");
+    });
+  }
   const lines: Line[] = [];
   const empty: number[] = [];
   const size = new Map<number, { w: number; h: number }>();
-  for (let n = 1; n <= doc.numPages; n++) {
-    if (n === 1 || n % 20 === 0) onStatus?.(`Reading page ${n} of ${doc.numPages}`);
+  try {
+    for (let n = 1; n <= doc.numPages; n++) {
+    if (n === 1 || n === doc.numPages || n % 5 === 0) onStatus?.(`Reading page ${n} of ${doc.numPages}`);
     const page = await doc.getPage(n);
     const view = page.getViewport({ scale: 1 });
     size.set(n, { w: view.width, h: view.height });
     const content = await page.getTextContent();
     const clustered = cluster(content.items as { str: string; transform: number[]; width?: number; height?: number }[]);
-    if (!clustered.length) empty.push(n);
-    for (const ln of clustered) lines.push({ ...ln, page: n, pageH: view.height, pageW: view.width });
+    page.cleanup();
+    const text = clustered.map((line) => line.text).join(" ");
+    if (!clustered.length || needsPicture(text)) empty.push(n);
+    else for (const ln of clustered) lines.push({ ...ln, page: n, pageH: view.height, pageW: view.width });
+    await breathe();
   }
   let warning: string | undefined;
+  if (empty.length) {
+    onStatus?.(
+      settings.pictures === "empty"
+        ? `${empty.length} ${empty.length === 1 ? "page has" : "pages have"} no text`
+        : `${empty.length} ${empty.length === 1 ? "page has" : "pages have"} no text. Pictures of pages is off.`,
+    );
+  } else {
+    onStatus?.("Every page already had text");
+  }
   if (empty.length && settings.pictures === "empty") {
+    const found = scriptIn(lines.map((line) => line.text).join("\n"));
+    const script = found !== "en" && settings.scripts.includes(found) ? found : "en";
+    if (script !== "en") onStatus?.(`The file contains ${scriptLabel(script)}. A picture page can use that reader beside English.`);
     try {
       const read = await readPicturePages(
         empty.map((n) => {
@@ -120,9 +154,12 @@ export async function folioFromPdf(
         doc.numPages,
         settings.kind,
         onStatus,
+        script,
+        settings.scripts,
       );
       lines.push(...read.lines);
       warning = read.warning;
+      if (!warning) onStatus?.(`Read ${empty.length} picture ${empty.length === 1 ? "page" : "pages"}`);
     } catch (err) {
       if (!lines.length) {
         throw err instanceof Error ? err : new Error("Could not read the pictures of those pages.");
@@ -133,7 +170,7 @@ export async function folioFromPdf(
     warning =
       settings.pictures === "off"
         ? "Pictures of pages is off, so the vision model was not used."
-        : "Every page already had text, so the vision model was not used.";
+        : "The vision model is downloading. Every page already had text, so it was not needed.";
     onStatus?.(warning);
   }
   let title = titleFromName(filename);
@@ -161,29 +198,37 @@ export async function folioFromPdf(
       cover = jpegFromRgba(canvas.width, canvas.height, frame.data);
       canvas.width = 0;
       canvas.height = 0;
+      onStatus?.("The first page is the cover");
     }
   } catch {
     /* a book with no drawable first page still converts */
   }
-  onStatus?.("Reading the contents");
-  const [outline, lexicon] = await Promise.all([readOutline(doc, doc.numPages), lexiconPromise]);
-  const folio = assembleFolio(lines, {
+  const outline = await readOutline(doc, doc.numPages);
+  const listed = outline.filter((item) => item.page || item.children.some((child) => child.page)).length;
+  onStatus?.(listed >= 2 ? `The file lists ${listed} chapters` : "The file has no contents list");
+  checkpoint();
+  const folio = await composeFolio(lines, {
     title,
     author,
     subtitle: author ? `${author} · from a PDF` : "From a PDF",
     sourceName: filename,
     outline,
-    lexicon,
+    lexiconPrefix: assetPrefix(),
+    cover,
     emptyMessage:
       settings.pictures === "empty" && empty.length
         ? "No text could be read from that PDF, including the pictures of its pages."
         : NO_TEXT,
     onStatus,
   });
-  if (warning) folio.warning = warning;
-  if (cover) folio.cover = cover;
+  folio.warning = [folio.warning, warning].filter(Boolean).join(" ") || undefined;
   folio.origin = { name: filename, kind: "pdf" };
-  return folio;
+    return folio;
+  } catch (err) {
+    const closer = doc as unknown as { destroy?: () => Promise<void> };
+    void closer.destroy?.().catch(() => {});
+    throw err;
+  }
 }
 
 export async function folioFromFile(
@@ -199,6 +244,6 @@ export async function folioFromFile(
   }
   const head = new Uint8Array(data.slice(0, 5));
   const pdf = head[0] === 0x25 && head[1] === 0x50 && head[2] === 0x44 && head[3] === 0x46;
-  if (lower.endsWith(".pdf") || pdf) return folioFromPdf(data, filename, onStatus);
+  if (lower.endsWith(".pdf") || pdf) return folioFromPdf(data, filename, onStatus, settings);
   throw new Error("Open a PDF or a DjVu file.");
 }

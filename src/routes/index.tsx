@@ -1,25 +1,34 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from "react";
-import { BookOpen, ChevronDown, Download, Menu, Search, X } from "lucide-react";
+import { BookOpen, ChevronDown, Download, Menu, Search, Settings, X } from "lucide-react";
 import book from "@/data/book.json";
 import { previewPathPrefix } from "@/lib/preview-path-prefix";
 import { folioFromFile, runPage, type Block, type Folio, type Run, type TocNode } from "@/folio/from-pdf";
 import { republish } from "@/folio/assemble";
 import { PassageEditor, SelectionMenu, type SelectionPick } from "@/folio/editor";
 import { applyChapters, bookKey, loadBook, proseSpan, rememberRevision, saveBook, sourceOf, syncToc, type Revision } from "@/folio/revise";
-import { detectKind, keepSource, loadSource, originalLabel, type Retained } from "@/folio/source";
+import { detectKind, dropOrphanSources, dropSource, keepSource, loadSource, originalLabel, type Retained } from "@/folio/source";
+import { explainSaveFailure, formatBytes, storageReport, until, type StorageReport } from "@/folio/storage";
+import { dropScriptReader, storeScriptReader } from "@/folio/ocr-pp";
+import { armJob, cancelJob, cancelled, checkpoint, JobCancelled } from "@/folio/job";
+import { prefetchVision } from "@/folio/ocr-vision";
+import { SCRIPT_CHOICES, scriptLabel, type ReaderScript } from "@/folio/script";
 import { SourcePane } from "@/folio/source-view";
 import {
   bareDesk,
+  dismissEntry,
   entryKey,
   forgetEntry,
   isSampleBook,
   keepFolio,
+  keepReadingCopy,
   listHoldings,
   listShelf,
   loadFolio,
   loadShelf,
   rememberOpened,
+  releaseCachedSample,
+  rememberFolio,
   rememberRecent,
   restoreSamples,
   SAMPLES,
@@ -94,8 +103,37 @@ function owns(owners: Map<string, string>, chapterId: string, index: number, slo
 
 function textOf(block: Block) {
   if (block.s) return block.s;
-  if (block.t === "table") return (block.rows || []).map((r) => r.join(" ")).join(" ");
+  if (block.t === "table") return [...(block.headers || []), ...(block.rows || []).flat()].join(" ");
   return (block.runs || []).filter((r): r is string => typeof r === "string").join(" ");
+}
+
+function sketchBook(book: Folio) {
+  const texts = book.chapters.flatMap((chapter) => chapter.blocks.map((block) => textOf(block).replace(/\s+/g, " ").trim())).filter(Boolean);
+  const lengths = texts.map((text) => text.length).sort((a, b) => a - b);
+  return {
+    title: book.title,
+    author: book.author,
+    warning: book.warning || "",
+    file: book.origin?.name || "",
+    chapters: book.chapters.slice(0, 40).map((chapter) => ({ title: chapter.title, blocks: chapter.blocks.length })),
+    blocks: book.chapters.reduce((sum, chapter) => sum + chapter.blocks.length, 0),
+    tables: book.chapters.reduce((sum, chapter) => sum + chapter.blocks.filter((block) => block.t === "table").length, 0),
+    notes: book.chapters.reduce((sum, chapter) => sum + chapter.blocks.filter((block) => block.kind === "note").length, 0),
+    longest: lengths[lengths.length - 1] || 0,
+    devanagari: texts.filter((text) => /\p{Script=Devanagari}/u.test(text)).length,
+    devanagariSample: texts.filter((text) => /\p{Script=Devanagari}/u.test(text)).slice(0, 8).map((text) => text.slice(0, 180)),
+    sample: texts.slice(0, 30).map((text) => text.slice(0, 240)),
+    tail: texts.slice(-10).map((text) => text.slice(0, 240)),
+  };
+}
+
+function watchOpening(payload: unknown) {
+  if (!import.meta.env.DEV) return;
+  fetch("/__recto/watch", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  }).catch(() => {});
 }
 
 const PLACE_KEY = "recto-desk:place";
@@ -113,10 +151,15 @@ function Desk() {
   const [log, setLog] = useState<string[]>([]);
   const [logOpen, setLogOpen] = useState(false);
   const logBox = useRef<HTMLDivElement>(null);
+  const logLines = useRef<string[]>([]);
   const [note, setNote] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [settings, setSettings] = useState<DeskSettings>(() => loadSettings());
+  useEffect(() => {
+    if (settings.kind !== "vision") return;
+    void prefetchVision().catch(() => {});
+  }, [settings.kind]);
   const [pick, setPick] = useState<SelectionPick | null>(null);
   const [menuNote, setMenuNote] = useState("");
   const [editing, setEditing] = useState<{ chapterId: string; from: number; to: number } | null>(null);
@@ -132,6 +175,7 @@ function Desk() {
   const toc = tocOf(folio);
 
   function begin(message: string) {
+    logLines.current = [message];
     setLog([message]);
     setBusy(message);
   }
@@ -142,7 +186,12 @@ function Desk() {
       return;
     }
     setBusy(message);
-    setLog((prev) => (prev[prev.length - 1] === message ? prev : [...prev, message]));
+    const prev = logLines.current;
+    if (prev[prev.length - 1] === message) return;
+    const next = [...prev, message].slice(-80);
+    logLines.current = next;
+    setLog(next);
+    watchOpening({ live: true, line: message });
   }
   const owners = useMemo(() => buildOwners(chapters), [chapters]);
   const lastPage = useMemo(() => {
@@ -486,16 +535,23 @@ function Desk() {
     }
   }
 
+  function cancelWork() {
+    cancelJob();
+    report("Cancelling…");
+  }
+
   async function openSample(id: string) {
     if (id === "dhammapada") {
       showLucis();
       return;
     }
     begin("Opening the edition");
+    armJob();
     setNote("");
     try {
       const res = await fetch(`/samples/${id}.json`);
       if (!res.ok) throw new Error("That edition could not be opened.");
+      if (cancelled()) throw new JobCancelled();
       const next = (await res.json()) as Folio;
       next.epubHref = `/samples/${id}.epub`;
       releaseEpub(folio.epubHref);
@@ -512,6 +568,11 @@ function Desk() {
         setShelf(nextShelf);
       }
     } catch (err) {
+      if (err instanceof JobCancelled) {
+        report("Cancelled.");
+        setNote("Cancelled.");
+        return;
+      }
       setNote(err instanceof Error ? err.message : "That edition could not be opened.");
     } finally {
       setBusy("");
@@ -520,80 +581,160 @@ function Desk() {
 
   async function onBook(event: ChangeEvent<HTMLInputElement>) {
     const input = event.target;
-    const file = input.files?.[0];
+    const files = Array.from(input.files || []);
     input.value = "";
-    if (!file) return;
-    begin("Opening the book");
+    if (!files.length) return;
+    armJob();
+    const many = files.length > 1;
+    begin(many ? `Opening 1 of ${files.length}` : "Opening the book");
     setNote("");
-    try {
-      const bytes = await file.arrayBuffer();
-      const next = await folioFromFile(bytes.slice(0), file.name, report, loadSettings());
-      const kind = next.origin?.kind || detectKind(file.name, new Uint8Array(bytes));
-      next.origin = { name: file.name, kind };
-      let shelfNote = "";
+    let opened = 0;
+    let href = folio.epubHref;
+    const problems: string[] = [];
+    for (let i = 0; i < files.length; i++) {
+      if (cancelled()) break;
+      const file = files[i];
+      if (many) report(`Opening ${i + 1} of ${files.length}: ${file.name}`);
       try {
-        await keepSource(bookKey(next), file.name, kind, bytes);
-        const saved = loadBook(bookKey(next));
-        const adopted = saved && Object.keys(saved.chapters).length ? republish(syncToc(applyChapters(next, saved.chapters))) : next;
-        if (!isSampleBook(adopted)) {
-          await keepFolio(bookKey(adopted), adopted);
-          const record = catalogFromOpened({
-            title: adopted.title,
-            author: adopted.author,
-            subtitle: adopted.subtitle,
-            filename: adopted.origin?.name,
-            format: adopted.origin?.kind === "djvu" ? "image/vnd.djvu" : adopted.origin?.kind === "pdf" ? "application/pdf" : "text",
-          });
-          const entry = {
-            id: bookKey(adopted),
-            title: adopted.title,
-            author: adopted.author || "",
-            kind: "opened" as const,
-            originName: adopted.origin?.name,
-            work: record.work,
-            edition: record.source,
-            translator: record.contributor,
-            year: record.date,
-            language: record.language,
-            volume: record.volume,
-          };
-          const kept = rememberOpened(loadShelf(), entry);
-          const remembered = kept.records?.[entry.id] ? kept : storeRecord(kept, entry, record);
-          saveShelf(remembered);
-          setShelf(remembered);
-        }
-        releaseEpub(folio.epubHref);
-        setFolio(adopted);
-        setRevisions(saved?.revisions ?? []);
+        const nextHref = await takeBook(file, true, href);
+        if (nextHref) href = nextHref;
+        opened += 1;
       } catch (err) {
-        shelfNote = err instanceof Error ? err.message : "The book opened, but it could not be kept on the shelf.";
-        releaseEpub(folio.epubHref);
-        setFolio(next);
+        if (err instanceof JobCancelled || cancelled()) {
+          report("Cancelled.");
+          setNote(opened ? `Cancelled. ${opened} ${opened === 1 ? "book is" : "books are"} already on the shelf.` : "Cancelled.");
+          break;
+        }
+        const message = err instanceof Error ? err.message : "Could not read that book.";
+        problems.push(many ? `${file.name}: ${message}` : message);
+        watchOpening({ file: file.name, bytes: file.size, error: message, log: logLines.current });
       }
+    }
+    if (cancelled()) {
+      setBusy("");
+      return;
+    }
+    if (many) {
+      const summary = opened
+        ? problems.length
+          ? `${opened} of ${files.length} books are on the shelf.`
+          : `${opened} books are on the shelf.`
+        : "None of those files could be opened.";
+      setNote([summary, ...problems].filter(Boolean).join(" "));
+      report(summary);
+    } else if (problems[0]) {
+      setNote(problems[0]);
+    }
+    setBusy("");
+  }
+
+  async function takeBook(file: File, show: boolean, releaseHref?: string) {
+    const bytes = await file.arrayBuffer();
+    const next = await folioFromFile(bytes.slice(0), file.name, report, loadSettings());
+    const kind = next.origin?.kind || detectKind(file.name, new Uint8Array(bytes));
+    next.origin = { name: file.name, kind };
+    if (!next.title?.trim()) next.title = file.name.replace(/\.[^.]+$/, "") || "Untitled";
+    let shelfNote = "";
+    const saved = loadBook(bookKey(next));
+    const adopted = saved && Object.keys(saved.chapters).length ? republish(syncToc(applyChapters(next, saved.chapters))) : next;
+    const remember = (book: Folio, fileName?: string) => {
+      if (isSampleBook(book)) return null;
+      rememberFolio(bookKey(book), book);
+      const record = catalogFromOpened({
+        title: book.title,
+        author: book.author,
+        subtitle: book.subtitle,
+        filename: fileName || book.origin?.name,
+        format: book.origin?.kind === "djvu" ? "image/vnd.djvu" : book.origin?.kind === "pdf" ? "application/pdf" : "text",
+      });
+      const entry = {
+        id: bookKey(book),
+        title: book.title,
+        author: book.author || "",
+        kind: "opened" as const,
+        originName: fileName,
+        work: record.work,
+        edition: record.source,
+        translator: record.contributor,
+        year: record.date,
+        language: record.language,
+        volume: record.volume,
+      };
+      const kept = rememberOpened(loadShelf(), entry);
+      const remembered = kept.records?.[entry.id] ? kept : storeRecord(kept, entry, record);
+      try {
+        saveShelf(remembered);
+      } catch {
+        shelfNote = "On the shelf for this visit. The list could not be stored for next time.";
+      }
+      setShelf(remembered);
+      return remembered;
+    };
+    const keepName = !isSampleBook(adopted) && loadSettings().keepFile ? file.name : undefined;
+    const placed = isSampleBook(adopted) ? null : remember(adopted, keepName);
+    if (show) {
+      releaseEpub(releaseHref);
+      setFolio(adopted);
+      setRevisions(saved?.revisions ?? []);
       setSource(null);
-      setActive(next.toc[0]?.id || "c01");
+      setActive(adopted.toc[0]?.id || "c01");
       setQuery("");
-      setNote([next.warning, shelfNote].filter(Boolean).join(" "));
       setSettingsOpen(false);
       setLibraryOpen(false);
-      setOpen(false);
-    } catch (err) {
-      setNote(err instanceof Error ? err.message : "Could not read that book.");
-    } finally {
-      setBusy("");
+      setOpen(true);
     }
+    if (!shelfNote) shelfNote = `${adopted.title} is on the shelf.`;
+    if (show) setNote([next.warning, shelfNote].filter(Boolean).join(" "));
+    report(shelfNote);
+    try {
+      checkpoint();
+      if (keepName) await until(keepSource(bookKey(adopted), file.name, kind, bytes), 8000);
+      else await until(dropOrphanSources([]), 2500).catch(() => 0);
+      checkpoint();
+      if (!isSampleBook(adopted)) {
+        await until(keepReadingCopy(bookKey(adopted), adopted), 20000);
+        void keepFolio(bookKey(adopted), adopted).catch(() => {});
+      }
+      const keptNote = keepName ? "Reading text kept, and the original file." : "Reading text kept.";
+      if (show) setNote([next.warning, keptNote].filter(Boolean).join(" "));
+      report(keptNote);
+    } catch (err) {
+      if (err instanceof JobCancelled) throw err;
+      const message = err instanceof Error ? err.message : "";
+      const measured = await until(storageReport(), 2000).catch(() => null);
+      const failed = explainSaveFailure(message, measured, !!placed);
+      if (show) setNote([next.warning, failed].filter(Boolean).join(" "));
+      report(failed);
+      watchOpening({
+        file: file.name,
+        bytes: file.size,
+        warning: next.warning || "",
+        shelfNote: failed,
+        log: logLines.current,
+        book: sketchBook(next),
+      });
+    }
+    watchOpening({
+      file: file.name,
+      bytes: file.size,
+      warning: next.warning || "",
+      shelfNote,
+      log: logLines.current,
+      book: sketchBook(next),
+    });
+    return adopted.epubHref;
   }
 
   async function openKept(entry: ShelfEntry) {
     begin("Opening the book");
+    armJob();
     setNote("");
     try {
       const next = await loadFolio(entry.id);
+      if (cancelled()) throw new JobCancelled();
       if (!next) {
-        const cleared = await forgetEntry(shelf, entry);
-        saveShelf(cleared);
-        setShelf(cleared);
-        setNote("That book is no longer on this device.");
+        setNote("That book could not be opened from this device.");
+        setBusy("");
         return;
       }
       const saved = loadBook(bookKey(next));
@@ -611,6 +752,11 @@ function Desk() {
       saveShelf(nextShelf);
       setShelf(nextShelf);
     } catch (err) {
+      if (err instanceof JobCancelled) {
+        report("Cancelled.");
+        setNote("Cancelled.");
+        return;
+      }
       setNote(err instanceof Error ? err.message : "Could not open that book.");
     } finally {
       setBusy("");
@@ -635,7 +781,7 @@ function Desk() {
     await openKept(first);
   }
 
-  async function confirmRemove() {
+  function confirmRemove() {
     if (!pending) return;
     if (pending.step === 1) {
       setPending({ entry: pending.entry, step: 2 });
@@ -643,15 +789,50 @@ function Desk() {
     }
     const entry = pending.entry;
     const removingOpen = bookKey(folio) === entryKey(entry);
-    const next = await forgetEntry(shelf, entry);
-    saveShelf(next);
+    const next = dismissEntry(shelf, entry);
     setShelf(next);
+    try {
+      saveShelf(next);
+    } catch {
+      /* the title is gone for this visit even if the list cannot be stored */
+    }
     setPending(null);
     setPick(null);
     setEditing(null);
     if (removingOpen) setSource(null);
-    setNote(`${entry.title} was removed from this device.`);
-    if (removingOpen) await openNext(next);
+    setNote(entry.sampleId ? `${entry.title} was taken off the shelf.` : `${entry.title} was removed.`);
+    void forgetEntry(next, entry).catch(() => {});
+    if (entry.sampleId) void releaseCachedSample(entry.sampleId).catch(() => 0);
+    if (!removingOpen) return;
+    const follow = listShelf(next)[0];
+    if (!follow) {
+      releaseEpub(folio.epubHref);
+      setFolio(bareDesk);
+      setActive("empty");
+      return;
+    }
+    if (follow.kind === "sample" && follow.sampleId) void openSample(follow.sampleId);
+    else void openKept(follow);
+  }
+
+  async function discardOriginal(entry: ShelfEntry) {
+    await dropSource(entry.id).catch(() => {});
+    const next = {
+      ...loadShelf(),
+      opened: loadShelf().opened.map((item) => (item.id === entry.id ? { ...item, originName: undefined } : item)),
+    };
+    saveShelf(next);
+    setShelf(next);
+    const stored = await loadFolio(entry.id).catch(() => null);
+    if (stored?.origin) {
+      const copy = { ...stored, origin: undefined };
+      await keepFolio(entry.id, copy).catch(() => {});
+    }
+    if (bookKey(folio) === entry.id) {
+      setFolio({ ...folio, origin: undefined });
+      setSource(null);
+    }
+    setNote(`The original file was discarded. The reading text of ${entry.title} stays.`);
   }
 
   const shelfEntries = listShelf(shelf);
@@ -794,7 +975,7 @@ function Desk() {
             })}
           </ol>
         </nav>
-        <div className="border-t border-desk-line px-4 py-3">
+        <div className="shrink-0 border-t border-desk-line px-4 py-3">
           {busy ? (
             <button
               type="button"
@@ -808,10 +989,11 @@ function Desk() {
             <label className="flex min-h-11 cursor-pointer items-center justify-center rounded-ui border border-desk-line bg-desk-soft px-3 py-2 text-center text-sm text-desk-fg">
               <span className="flex flex-col items-center leading-tight">
                 <span>Open a book</span>
-                <span className="text-xs text-desk-muted">PDF or DjVu</span>
+                <span className="text-xs text-desk-muted">One or several</span>
               </span>
               <input
                 type="file"
+                multiple
                 accept="application/pdf,.pdf,.djvu,.djv,image/vnd.djvu,image/x-djvu"
                 className="sr-only"
                 onChange={onBook}
@@ -836,7 +1018,6 @@ function Desk() {
                   className="h-8 shrink-0 px-1 text-xs text-desk-muted"
                   aria-label={`Remove ${entry.title}`}
                   onClick={() => setPending({ entry, step: 1 })}
-                  disabled={!!busy}
                 >
                   Remove
                 </button>
@@ -854,34 +1035,9 @@ function Desk() {
             >
               {libraryOpen ? "The book" : `Library (${listHoldings(shelf).length})`}
             </button>
-            {shelf.hidden.length ? (
-              <button
-                type="button"
-                className="mt-1 h-8 text-left text-xs text-desk-muted"
-                onClick={() => {
-                  const next = restoreSamples(shelf);
-                  saveShelf(next);
-                  setShelf(next);
-                }}
-                disabled={!!busy}
-              >
-                Put the sample editions back
-              </button>
-            ) : null}
           </div>
-          <button
-            type="button"
-            className="mt-2 h-11 w-full text-sm text-desk-muted"
-            onClick={() => {
-              setSettingsOpen((openNow) => !openNow);
-              setLibraryOpen(false);
-              setOpen(false);
-            }}
-          >
-            {settingsOpen ? "The book" : "Settings"}
-          </button>
         </div>
-        <form onSubmit={jumpToPage} className="border-t border-desk-line px-4 py-3">
+        <form onSubmit={jumpToPage} className="shrink-0 border-t border-desk-line px-4 py-3">
           <label className="mb-1 block text-xs tracking-wide text-desk-muted" htmlFor="printed-page">
             Page
           </label>
@@ -967,6 +1123,23 @@ function Desk() {
             <Download className="size-4" aria-hidden="true" />
             <span className="hidden sm:inline">EPUB</span>
           </a>
+          <button
+            type="button"
+            className={
+              "grid size-11 shrink-0 place-items-center rounded-ui border " +
+              (settingsOpen ? "border-cinnabar bg-paper-2 text-cinnabar" : "border-rule text-ink")
+            }
+            aria-label={settingsOpen ? "Back to the book" : "Settings"}
+            aria-pressed={settingsOpen}
+            onClick={() => {
+              setSettingsOpen((openNow) => !openNow);
+              setLibraryOpen(false);
+              setOpen(false);
+              setWheel(false);
+            }}
+          >
+            <Settings className="size-5" aria-hidden="true" />
+          </button>
           {wheel && !settingsOpen ? (
             <>
               <button
@@ -1039,6 +1212,12 @@ function Desk() {
           {settingsOpen ? (
             <SettingsSheet
               settings={settings}
+              hiddenSamples={shelf.hidden.length}
+              onRestoreSamples={() => {
+                const next = restoreSamples(shelf);
+                saveShelf(next);
+                setShelf(next);
+              }}
               onChange={(next) => {
                 setSettings(next);
                 saveSettings(next);
@@ -1055,6 +1234,7 @@ function Desk() {
                 saveShelf(next);
                 setShelf(next);
               }}
+              onDiscardFile={(entry) => discardOriginal(entry)}
               onClose={() => setLibraryOpen(false)}
             />
           ) : (
@@ -1109,10 +1289,17 @@ function Desk() {
       {logOpen ? (
         <div className="fixed inset-x-0 bottom-0 z-50 flex h-[min(50dvh,32rem)] flex-col border-t border-desk-line bg-desk text-desk-fg">
           <div className="flex shrink-0 items-center justify-between px-4 py-1 md:px-6">
-            <p className="text-xs tracking-wide text-desk-muted uppercase">Opening</p>
-            <button type="button" className="h-11 px-2 text-sm text-desk-muted" onClick={() => setLogOpen(false)}>
-              Close
-            </button>
+            <p className="text-xs tracking-wide text-desk-muted uppercase">Log</p>
+            <div className="flex items-center">
+              {busy ? (
+                <button type="button" className="h-11 px-3 text-sm text-cinnabar" onClick={cancelWork}>
+                  Cancel
+                </button>
+              ) : null}
+              <button type="button" className="h-11 px-2 text-sm text-desk-muted" onClick={() => setLogOpen(false)}>
+                Close
+              </button>
+            </div>
           </div>
           <div ref={logBox} className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 md:px-6">
             <ol className="opening-log">
@@ -1145,7 +1332,7 @@ function Desk() {
               {pending.step === 1
                 ? "This is the title on the shelf. Continue only if it is the one you mean to take off."
                 : pending.entry.kind === "sample"
-                  ? "The reading place and any saved edits for this edition will be deleted. You can put the sample back on the shelf later. The copy that came with the app stays."
+                  ? "The stored copy of this edition is deleted from this device. You can put the sample back on the shelf later. It is fetched again only if you open it."
                   : `The reading place, saved edits, converted text${pending.entry.originName ? `, and the original file ${pending.entry.originName}` : ""} will be deleted. This cannot be undone.`}
             </p>
             <div className="mt-5 flex justify-end gap-2">
@@ -1168,40 +1355,40 @@ function LibrarySheet({
   onOpen,
   onRemove,
   onSave,
+  onDiscardFile,
   onClose,
 }: {
   shelf: ShelfState;
   onOpen: (entry: ShelfEntry) => void;
   onRemove: (entry: ShelfEntry) => void;
   onSave: (entry: ShelfEntry, record: CatalogRecord) => void;
+  onDiscardFile: (entry: ShelfEntry) => Promise<void>;
   onClose: () => void;
 }) {
   const [filter, setFilter] = useState("");
-  const [sortKey, setSortKey] = useState<DcElement>("creator");
+  const [sortKey, setSortKey] = useState<DcElement | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [editing, setEditing] = useState<ShelfEntry | null>(null);
   const [draft, setDraft] = useState<CatalogRecord | null>(null);
   const [idsOpen, setIdsOpen] = useState(false);
-  const rows = sortRecords(
-    listHoldings(shelf)
-      .map((entry) => ({ entry, record: recordFor(shelf, entry) }))
-      .filter(({ record }) => {
-        const q = filter.trim().toLowerCase();
-        if (!q) return true;
-        const blob = [
-          ...DC_ELEMENTS.map((key) => record[key]),
-          record.work,
-          record.expression,
-          record.volume,
-          ...Object.values(record.ids),
-        ]
-          .join(" ")
-          .toLowerCase();
-        return blob.includes(q);
-      }),
-    sortKey,
-    sortDir,
-  );
+  const [discarding, setDiscarding] = useState(false);
+  const listed = listHoldings(shelf)
+    .map((entry) => ({ entry, record: recordFor(shelf, entry) }))
+    .filter(({ record }) => {
+      const q = filter.trim().toLowerCase();
+      if (!q) return true;
+      const blob = [
+        ...DC_ELEMENTS.map((key) => record[key]),
+        record.work,
+        record.expression,
+        record.volume,
+        ...Object.values(record.ids),
+      ]
+        .join(" ")
+        .toLowerCase();
+      return blob.includes(q);
+    });
+  const rows = sortKey ? sortRecords(listed, sortKey, sortDir) : listed;
   if (editing && draft) {
     const set = (key: DcElement, value: string) => setDraft({ ...draft, [key]: value });
     return (
@@ -1280,6 +1467,33 @@ function LibrarySheet({
             Cancel
           </button>
         </div>
+        {editing.kind === "opened" && editing.originName ? (
+          <div className="mt-8 border-t border-rule pt-4">
+            <p className="text-sm leading-relaxed text-muted">
+              The original file {editing.originName} is on this device. Discarding it leaves the reading text.
+            </p>
+            {discarding ? (
+              <p className="mt-2 text-sm">Delete {editing.originName}? The converted text stays.</p>
+            ) : null}
+            <button
+              type="button"
+              className="mt-3 h-11 text-sm text-cinnabar"
+              onClick={() => {
+                if (!discarding) {
+                  setDiscarding(true);
+                  return;
+                }
+                const entry = editing;
+                void onDiscardFile(entry).then(() => {
+                  setDiscarding(false);
+                  setEditing({ ...entry, originName: undefined });
+                });
+              }}
+            >
+              {discarding ? "Discard the file" : "Discard the original file"}
+            </button>
+          </div>
+        ) : null}
       </form>
     );
   }
@@ -1290,7 +1504,7 @@ function LibrarySheet({
       </button>
       <h1 className="mt-6 font-serif text-3xl">Library</h1>
       <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted">
-        Each volume is a Dublin Core record. Sort any column, filter the catalog, and edit the metadata. Serial and item numbers stay on the record, not in this table.
+        Each volume is a Dublin Core record. A book you just opened is at the top. Sort any column to order the catalog.
       </p>
       <label className="mt-4 flex w-full max-w-xs flex-col gap-1 text-sm text-muted">
         Filter records
@@ -1351,6 +1565,7 @@ function LibrarySheet({
                       const next = recordFor(shelf, entry);
                       setDraft(next);
                       setIdsOpen(Object.values(next.ids).some((value) => value?.trim()));
+                      setDiscarding(false);
                       setEditing(entry);
                     }}
                   >
@@ -1400,6 +1615,68 @@ function IdFields({
   );
 }
 
+function StorageFigures() {
+  const [report, setReport] = useState<StorageReport | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let live = true;
+    storageReport()
+      .then((next) => {
+        if (live) setReport(next);
+      })
+      .catch(() => {
+        if (live) setFailed(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const used = report?.usage;
+  const quota = report?.quota;
+  const share = used != null && quota ? Math.min(100, Math.round((used / quota) * 100)) : null;
+  const tight = used != null && quota != null && quota > 0 && used > quota * 0.85;
+  return (
+    <section className="mt-8 border-t border-rule pt-6">
+      <h2 className="font-serif text-xl">Storage</h2>
+      <p className="mt-2 text-sm leading-relaxed text-muted">
+        This is the room this site may use in this browser. It is not the free space on the computer. The English picture reader is included and starts on. Any other script reader is used only if you turn it on.
+        {report?.persisted === false ? " The browser may still clear it when space is low." : ""}
+        {report?.persisted === true ? " The browser has agreed to keep it." : ""}
+      </p>
+      {failed ? <p className="mt-3 text-sm">Storage could not be measured.</p> : null}
+      {!report && !failed ? <p className="mt-3 text-sm text-muted">Measuring…</p> : null}
+      {report ? (
+        <>
+          <p className="mt-4 text-sm">
+            {used != null && quota != null ? (
+              <>
+                <span className="font-medium">{formatBytes(used)}</span> used of <span className="font-medium">{formatBytes(quota)}</span>
+                {share != null ? ` (${share}%)` : ""}
+              </>
+            ) : (
+              "This browser does not say how much room is left."
+            )}
+          </p>
+          <p className="mt-1 text-sm text-muted">
+            {tight ? "This site is close to the limit the browser allows." : "This is not full unless the used amount is near the limit."}
+          </p>
+          <dl className="mt-4 grid gap-2">
+            {report.lines.map((line) => (
+              <div key={line.label} className="flex items-baseline justify-between gap-4 border-b border-rule py-1 text-sm">
+                <dt className="text-muted">
+                  {line.label}
+                  {line.detail ? <span className="mt-0.5 block text-xs">{line.detail}</span> : null}
+                </dt>
+                <dd className="tabular-nums">{line.bytes == null ? "Not measured" : formatBytes(line.bytes)}</dd>
+              </div>
+            ))}
+          </dl>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
 function Choice({ on, label, hint, onPick }: { on: boolean; label: string; hint: string; onPick: () => void }) {
   return (
     <button
@@ -1416,13 +1693,70 @@ function Choice({ on, label, hint, onPick }: { on: boolean; label: string; hint:
 
 function SettingsSheet({
   settings,
+  hiddenSamples,
+  onRestoreSamples,
   onChange,
   onClose,
 }: {
   settings: DeskSettings;
+  hiddenSamples: number;
+  onRestoreSamples: () => void;
   onChange: (next: DeskSettings) => void;
   onClose: () => void;
 }) {
+  const [scriptNote, setScriptNote] = useState("");
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const [visionNote, setVisionNote] = useState("");
+  useEffect(() => {
+    if (settings.kind !== "vision") return;
+    let stop = false;
+    void prefetchVision((message) => {
+      if (!stop) setVisionNote(message);
+    })
+      .then(() => {
+        if (!stop) setVisionNote("The vision model is ready.");
+      })
+      .catch((err: unknown) => {
+        if (stop) return;
+        setVisionNote(err instanceof Error ? err.message : "The vision model did not start.");
+      });
+    return () => {
+      stop = true;
+    };
+  }, [settings.kind]);
+  async function toggleScript(id: ReaderScript) {
+    const current = settingsRef.current;
+    const on = current.scripts.includes(id);
+    if (id === "en") {
+      const scripts = (on ? current.scripts.filter((script) => script !== id) : ["en", ...current.scripts]) as ReaderScript[];
+      const next = { ...current, scripts };
+      settingsRef.current = next;
+      onChange(next);
+      setScriptNote(on ? "English is off. A picture page is not read with it." : "English is on.");
+      return;
+    }
+    if (on) {
+      const next = { ...current, scripts: current.scripts.filter((script) => script !== id) };
+      settingsRef.current = next;
+      onChange(next);
+      setScriptNote(`The ${scriptLabel(id)} reader is off.`);
+      void dropScriptReader(id).catch(() => {});
+      return;
+    }
+    const next = { ...current, scripts: [...current.scripts, id] };
+    settingsRef.current = next;
+    onChange(next);
+    setScriptNote(`The ${scriptLabel(id)} reader is on. Storing it…`);
+    try {
+      await storeScriptReader(id);
+      if (!settingsRef.current.scripts.includes(id)) return;
+      setScriptNote(`The ${scriptLabel(id)} reader is stored.`);
+    } catch {
+      if (!settingsRef.current.scripts.includes(id)) return;
+      setScriptNote(`The ${scriptLabel(id)} reader is on. It is fetched when a picture page needs it.`);
+    }
+  }
   return (
     <div className="mx-auto w-full max-w-2xl px-5 pt-8 pb-24 md:px-8">
       <button type="button" className="text-sm text-muted" onClick={onClose}>
@@ -1430,6 +1764,24 @@ function SettingsSheet({
       </button>
       <h1 className="mt-6 font-serif text-3xl">Settings</h1>
       <p className="mt-2 text-sm text-muted">Used the next time you open a book. The sample edition is unchanged.</p>
+      <StorageFigures />
+      <fieldset className="mt-8">
+        <legend className="text-sm font-medium">Original file</legend>
+        <div className="mt-3 grid gap-2">
+          <Choice
+            on={!settings.keepFile}
+            label="Reading text only"
+            hint="The PDF or DjVu is not stored. The converted book stays on the shelf."
+            onPick={() => onChange({ ...settings, keepFile: false })}
+          />
+          <Choice
+            on={settings.keepFile}
+            label="Keep the original file"
+            hint="Stores the file in this browser so a page can be opened beside the text. This is what fills the site’s storage."
+            onPick={() => onChange({ ...settings, keepFile: true })}
+          />
+        </div>
+      </fieldset>
       <fieldset className="mt-8">
         <legend className="text-sm font-medium">Pictures of pages</legend>
         <div className="mt-3 grid gap-2">
@@ -1450,8 +1802,26 @@ function SettingsSheet({
       <div className="mt-10 border-t border-rule pt-6">
         <p className="text-sm font-medium">PP-OCR</p>
         <p className="mt-2 text-sm leading-relaxed text-muted">
-          This reads those empty pages. It is included with the desk, and it uses the graphics chip when this browser can, and the processor otherwise.
+          This reads those empty pages. It uses the graphics chip when this browser can, and the processor otherwise. English is the only reader that starts on. The others start off, because each one reads the page again.
         </p>
+        <div className="mt-4 grid gap-2">
+          <Choice
+            on={settings.scripts.includes("en")}
+            label="English"
+            hint="Ordinary English. This is the only reader that starts on."
+            onPick={() => void toggleScript("en")}
+          />
+          {SCRIPT_CHOICES.map((choice) => (
+            <Choice
+              key={choice.id}
+              on={settings.scripts.includes(choice.id)}
+              label={choice.label}
+              hint={`${choice.hint}. ${formatBytes(choice.bytes)}. Off until this is on. Turning it on stores the reader, and a picture page that needs it is read again.`}
+              onPick={() => void toggleScript(choice.id)}
+            />
+          ))}
+        </div>
+        {scriptNote ? <p className="mt-2 text-xs leading-relaxed text-muted">{scriptNote}</p> : null}
         <button
           type="button"
           aria-pressed={settings.kind === "vision"}
@@ -1463,16 +1833,30 @@ function SettingsSheet({
         >
           <span className="text-sm">Use a vision model instead</span>
           <span className="mt-1 block text-xs leading-relaxed text-muted">
-            Off unless you turn this on. The first picture page downloads a few hundred megabytes. It runs only through WebGPU. If
-            that is not available, those pages are read with PP-OCR.
+            Off unless you turn this on. Turning it on starts the download. It uses the graphics chip when this browser can run it, including a
+            chip that has no half precision, and the processor when no chip answers. A page that already has text is not read again.
           </span>
         </button>
+        {visionNote ? <p className="mt-2 text-xs leading-relaxed text-muted">{visionNote}</p> : null}
         <p className="mt-3 text-xs leading-relaxed text-muted">
           WebGPU is already on in current Chrome, Edge, and Brave on Windows and macOS, when hardware acceleration is on. On Linux
           the same browsers usually need WebGPU switched on, and there WebGPU is Vulkan. Firefox has WebGPU on Windows and on Apple
           silicon, and not on Linux. Brave can also hide the graphics chip. The desk cannot turn any of this on.
         </p>
       </div>
+      <section className="mt-8 border-t border-rule pt-6">
+        <h2 className="font-serif text-xl">Sample editions</h2>
+        <p className="mt-2 text-sm leading-relaxed text-muted">
+          {hiddenSamples
+            ? `${hiddenSamples === 1 ? "One sample edition is" : `${hiddenSamples} sample editions are`} off the shelf. Putting them back does not download them until you open one.`
+            : "The sample editions are on the shelf. Removing one hides it. It can be put back here."}
+        </p>
+        {hiddenSamples ? (
+          <button type="button" className="mt-4 h-11 rounded-ui border border-rule px-3 text-sm" onClick={onRestoreSamples}>
+            Put the sample editions back
+          </button>
+        ) : null}
+      </section>
     </div>
   );
 }
@@ -1615,6 +1999,7 @@ function BlockView({
     block.kind === "verse" ? "verse" : "",
     block.kind === "center" ? "center" : "",
     block.kind === "extract" ? "extract" : "",
+    block.kind === "note" ? "note" : "",
   ]
     .filter(Boolean)
     .join(" ");
