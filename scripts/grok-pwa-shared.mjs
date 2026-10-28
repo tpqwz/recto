@@ -151,14 +151,28 @@ export function stripInstallParams(url) {
   return rest ? `${path}?${rest}` : path;
 }
 
-export function renderInstallPageHtml(template, { host, url } = {}) {
+function installName(hostHeader, site) {
+  const fromSite = String(site?.title ?? "").trim();
+  if (fromSite) return fromSite;
+  return appNameFromHost(hostHeader);
+}
+
+function manifestColor(site) {
+  const hex = placeholderCardColor(site);
+  return hex ? `#${hex}` : "#000000";
+}
+
+export function renderInstallPageHtml(template, { host, url, site } = {}) {
+  const identity = site === undefined ? snapshotOgIdentity().site : site;
   return String(template)
-    .replaceAll("{{APP_NAME}}", escapeHtml(appNameFromHost(host)))
+    .replaceAll("{{APP_NAME}}", escapeHtml(installName(host, identity)))
     .replaceAll("{{APP_URL}}", escapeHtml(stripInstallParams(url)));
 }
 
-export function renderWebManifest(hostHeader) {
-  const name = appNameFromHost(hostHeader);
+export function renderWebManifest(hostHeader, site) {
+  const identity = site === undefined ? snapshotOgIdentity().site : site;
+  const name = installName(hostHeader, identity);
+  const color = manifestColor(identity);
   return JSON.stringify(
     {
       name,
@@ -167,13 +181,31 @@ export function renderWebManifest(hostHeader) {
       start_url: "/",
       scope: "/",
       display: "standalone",
-      background_color: "#000000",
-      theme_color: "#000000",
+      background_color: color,
+      theme_color: color,
       icons: [
         {
           src: "/__grok/icon-180.png",
           sizes: "180x180",
           type: "image/png",
+        },
+        {
+          src: "/icon-192.png",
+          sizes: "192x192",
+          type: "image/png",
+          purpose: "any",
+        },
+        {
+          src: "/icon-512.png",
+          sizes: "512x512",
+          type: "image/png",
+          purpose: "any",
+        },
+        {
+          src: "/icon-maskable-512.png",
+          sizes: "512x512",
+          type: "image/png",
+          purpose: "maskable",
         },
       ],
     },

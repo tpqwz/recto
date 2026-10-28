@@ -21,8 +21,13 @@ let lastBreath = 0;
 async function breathe() {
   checkpoint();
   const now = performance.now();
-  if (now - lastBreath < 48) return;
+  if (now - lastBreath < 16) return;
   lastBreath = now;
+  const sched = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+  if (sched?.yield) {
+    await sched.yield();
+    return;
+  }
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 

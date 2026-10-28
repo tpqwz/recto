@@ -207,14 +207,44 @@ function joinParagraph(group: Line[], hyphens: { n: number }, printed: PrintedPa
 }
 
 function normalizeOutline(items: OutlineItem[]) {
-  const kept = items.filter((item) => item.label.trim() && (item.page || item.children.some((child) => child.page)));
+  const lifted = liftNestedChapters(items);
+  const kept = lifted.filter((item) => item.label.trim() && (item.page || item.children.some((child) => child.page)));
   if (kept.length === 1 && kept[0].children.filter((child) => child.page).length >= 2) {
-    return kept[0].children.filter((child) => child.page);
+    return sortChapterItems(kept[0].children.filter((child) => child.page));
   }
-  return kept.filter((item) => item.page);
+  return sortChapterItems(kept.filter((item) => item.page));
 }
 
-const CONTENTS_HEAD = /^(?:the\s+)?(?:table\s+of\s+)?contents\b|^(?:list\s+of\s+)?chapters\b/i;
+/** Chapter bookmarks tucked under the last chapter are still chapters. */
+function liftNestedChapters(items: OutlineItem[]): OutlineItem[] {
+  const out: OutlineItem[] = [];
+  for (const item of items) {
+    const nested = item.children.filter((child) => chapterIndex(child.label));
+    if (nested.length >= 4) {
+      out.push(...liftNestedChapters(nested));
+      out.push({ ...item, children: item.children.filter((child) => !chapterIndex(child.label)) });
+    } else out.push(item);
+  }
+  return out;
+}
+
+function sortChapterItems(items: OutlineItem[]) {
+  const numbered = items.filter((item) => chapterIndex(item.label));
+  if (numbered.length < 8) return items;
+  const ordered = [...numbered].sort((a, b) => (chapterIndex(a.label) || 0) - (chapterIndex(b.label) || 0));
+  const rest = items.filter((item) => !chapterIndex(item.label));
+  const first = Math.min(...ordered.map((item) => item.page || Infinity));
+  return [...rest.filter((item) => (item.page || Infinity) <= first), ...ordered, ...rest.filter((item) => (item.page || Infinity) > first)];
+}
+
+function outlineCoversStart(items: OutlineItem[]) {
+  if (items.length < 2) return false;
+  const nums = items.map((item) => chapterIndex(item.label)).filter((n): n is number => n != null);
+  if (nums.length < 8) return true;
+  return Math.min(...nums) <= 1;
+}
+
+const CONTENTS_HEAD = /^(?:the\s+)?(?:table\s+of\s+)?contents\b|^(?:list\s+of\s+)chapters\b/i;
 const CONTENTS_ENTRY = /^(.{2,90}?)(?:\s*[.\u00b7\u2026_]{2,}\s*|\s{2,})([0-9]{1,4}|[ivxlcdm]{1,8})\s*$/i;
 const PAGE_TOKEN = /^([0-9]{1,4}|[ivxlcdm]{1,8})$/i;
 
@@ -230,7 +260,7 @@ export function contentsEntry(line: { text: string; cells?: { text: string }[] }
     const title = dotted[1].replace(/[.\s]+$/g, "").trim();
     if (title.length > 1) return { title, token: dotted[2] };
   }
-  const loose = /^(?:\d{1,3}[.)]\s+)?([A-Za-z][^.]{2,110}?)\s+([0-9]{1,4}|[ivxlcdm]{1,8})$/i.exec(text);
+  const loose = /^(?:\d{1,3}[.)]\s+)?([A-Za-z].{1,120}?)\s+([0-9]{1,4})$/i.exec(text);
   if (loose && /[A-Za-z]/.test(loose[1]) && !/[.?!]$/.test(loose[1])) return { title: loose[1].trim(), token: loose[2] };
   return null;
 }
@@ -244,23 +274,81 @@ function contentsPair(cells: string[] | undefined): { title: string; token: stri
   return { title, token: usable[1] };
 }
 
-/** Every title and page on a line. One line sometimes holds several, or the same one twice. */
+/** Every title and page on a line. One line sometimes holds two columns, or the same entry twice. */
 function allEntries(line: Line): { title: string; token: string }[] {
-  const one = contentsEntry(line);
-  if (one) return [one];
+  const paired = pairCells(line.cells);
+  if (paired.length >= 2) return paired;
   const text = untwinLine(line.text).replace(/\s+/g, " ").trim();
+  const dotted = text ? dottedEntries(text) : [];
+  if (dotted.length >= 2) return dotted;
+  const twoChapters = /\b(?:chapter|book)\s+\d+\b.*\b(?:chapter|book)\s+\d+\b/i.test(text);
+  const one = contentsEntry(line);
+  if (one && !twoChapters) return [one];
+  if (dotted.length === 1 && !twoChapters) return dotted;
   if (!text || text.length > 600) return [];
+  const found = splitNumberedLine(text);
+  if (found.length === 1 && /^(?:chapter|book)\s*\d+\b/i.test(found[0].title)) return found;
+  if (found.length < 2) return [];
+  const chapters = found.filter((entry) => /^(?:chapter|book)\s+\d+\b/i.test(entry.title)).length;
+  if (chapters >= 2) return found;
+  const bare = text.replace(/[.\u00b7…_\s]/g, "").length;
+  const covered = found.reduce((sum, entry) => sum + entry.title.replace(/\s/g, "").length + entry.token.length, 0);
+  if (bare && covered < bare * 0.45) return [];
+  return found;
+}
+
+/** A year inside a title is not the page, and neither is the number in "Chapter 12". */
+function splitNumberedLine(text: string): { title: string; token: string }[] {
   const found: { title: string; token: string }[] = [];
-  const pattern = /([A-Za-z][A-Za-z0-9'’,:\-() ]{2,68}?)\s+(?:[.\u00b7…_]{2,}\s*)?(\d{1,4})\b/g;
+  const pattern = /\b(\d{1,4}|[ivxlcdm]{1,8})\b/gi;
+  let from = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    const token = match[1];
+    const raw = text.slice(from, match.index);
+    const title = raw.replace(/[.\u00b7…_\s]+$/g, "").trim();
+    if (/\b(?:chapter|book)\s*$/i.test(title)) continue;
+    const digits = /^\d+$/.test(token) ? Number(token) : null;
+    const rest = text.slice(match.index + token.length);
+    if (digits != null && digits >= 1000 && (/\b(?:chapter|book)\s+\d+\b/i.test(rest) || /\b\d{1,4}\b/.test(rest))) continue;
+    if (title.length < 3 || /[.?!]$/.test(title) || !/[A-Za-z]/.test(title)) {
+      from = match.index + token.length;
+      continue;
+    }
+    found.push({ title, token });
+    from = match.index + token.length;
+  }
+  return found;
+}
+
+/** A contents row split into cells: title, page, title, page. */
+function pairCells(cells: { text: string }[] | undefined): { title: string; token: string }[] {
+  if (!cells || cells.length < 4) return [];
+  const found: { title: string; token: string }[] = [];
+  let title = "";
+  for (const cell of cells) {
+    const text = cell.text.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    if (PAGE_TOKEN.test(text) && title && /[A-Za-z]/.test(title) && title.length <= 90 && !/[.?!]$/.test(title)) {
+      found.push({ title: title.replace(/[.\s]+$/g, "").trim(), token: text });
+      title = "";
+      continue;
+    }
+    if (PAGE_TOKEN.test(text)) continue;
+    title = title ? `${title} ${text}` : text;
+  }
+  return found.length >= 2 ? found : [];
+}
+
+function dottedEntries(text: string): { title: string; token: string }[] {
+  const found: { title: string; token: string }[] = [];
+  const pattern = /([A-Za-z][^.]{2,80}?)\s*[.\u00b7…]{2,}\s*(\d{1,4}|[ivxlcdm]{1,8})\b/gi;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(text))) {
     const title = match[1].replace(/[.\s]+$/g, "").trim();
     if (title.length < 3 || /[.?!]$/.test(title)) continue;
     found.push({ title, token: match[2] });
   }
-  if (found.length < 2) return [];
-  const covered = found.reduce((sum, entry) => sum + entry.title.length + entry.token.length, 0);
-  if (covered < text.replace(/\s/g, "").length * 0.45) return [];
   return found;
 }
 
@@ -285,7 +373,27 @@ function fileForLabel(printed: PrintedPages, token: string, maxPage: number) {
     const label = printed.label(file);
     if (label != null && String(label).toLowerCase() === want) return file;
   }
-  return null;
+  if (!/^\d+$/.test(token)) return null;
+  const page = Number(token);
+  const scores = new Map<number, number>();
+  for (let file = 1; file <= maxPage; file++) {
+    const label = printed.label(file);
+    if (typeof label !== "number") continue;
+    const offset = file - label;
+    scores.set(offset, (scores.get(offset) || 0) + 1);
+  }
+  let bestOffset = 0;
+  let best = 0;
+  for (const [offset, count] of scores) {
+    if (count > best) {
+      best = count;
+      bestOffset = offset;
+    }
+  }
+  if (best < 2) return null;
+  const file = page + bestOffset;
+  if (file < 1 || file > maxPage) return null;
+  return file;
 }
 
 /** A printed contents list. A list in the front of the book wins over an index at the back. A title the word list does not recognize is a broken contents line, not a chapter. */
@@ -313,7 +421,9 @@ function stitchContents(lines: Line[]): { text: string; lines: Line[] }[] {
       endsWithPage(text) &&
       text.split(/\s+/).length <= 6 &&
       line.x0 + 8 >= last.x0;
-    if (prev && (indented || tail)) {
+    const fresh = /^(?:chapter|book)\s*\d+\b/i.test(text);
+    const chapterHead = !!prev && /^(?:chapter|book)(?:\s*\d+|\s+[a-z]+|s)?\s*$/i.test(prev.text.trim());
+    if (prev && !fresh && (indented || tail || (chapterHead && same))) {
       prev.text = `${prev.text} ${text}`.replace(/\s+/g, " ").trim();
       prev.lines.push(line);
       continue;
@@ -323,6 +433,67 @@ function stitchContents(lines: Line[]): { text: string; lines: Line[] }[] {
   return groups;
 }
 
+function untitledChapter(text: string) {
+  const clean = text.replace(/\s+/g, " ").trim();
+  const match = /^(?:chapter|book)\s*(\d+)\b\s*(.*)$/i.exec(clean);
+  if (!match || endsWithPage(clean)) return "";
+  const rest = match[2].replace(/[.\s]+$/g, "").trim();
+  return `Chapter ${match[1]}${rest ? ` ${rest}` : ""}`;
+}
+
+/** "Chapters" and "Chapter So" are a misread number when the neighbors are one apart. */
+function repairChapterLabels(groups: { text: string }[]) {
+  const nums = groups.map((group) => chapterIndex(group.text));
+  for (let i = 0; i < groups.length; i++) {
+    if (nums[i]) continue;
+    if (!/^chapter/i.test(groups[i].text)) continue;
+    const prev = [...nums.slice(0, i)].reverse().find((n) => n);
+    const next = nums.slice(i + 1).find((n) => n);
+    if (!prev || next !== prev + 2) continue;
+    const fixed = prev + 1;
+    if (/^chapter\s+[a-z]+\b/i.test(groups[i].text)) groups[i].text = groups[i].text.replace(/^chapter\s+[a-z]+\b/i, `Chapter ${fixed}`);
+    else groups[i].text = groups[i].text.replace(/^chapters?\b/i, `Chapter ${fixed}`);
+    nums[i] = fixed;
+  }
+}
+
+function placeMissingPages(hits: { title: string; page: number }[]) {
+  const known = hits.filter((hit) => hit.page > 0 && chapterIndex(hit.title));
+  let last = 0;
+  for (const hit of hits) if (hit.page > last) last = hit.page;
+  for (const hit of hits) {
+    if (hit.page > 0) continue;
+    const n = chapterIndex(hit.title);
+    if (!n) {
+      hit.page = ++last;
+      continue;
+    }
+    const before = known.filter((item) => (chapterIndex(item.title) || 0) < n).sort((a, b) => (chapterIndex(a.title) || 0) - (chapterIndex(b.title) || 0));
+    const after = known.filter((item) => (chapterIndex(item.title) || 0) > n).sort((a, b) => (chapterIndex(a.title) || 0) - (chapterIndex(b.title) || 0));
+    const prev = before[before.length - 1];
+    const next = after[0];
+    if (prev && next && next.page > prev.page + 1) hit.page = Math.round((prev.page + next.page) / 2);
+    else if (next && next.page > 1) hit.page = next.page - 1;
+    else if (prev) hit.page = prev.page + 1;
+    else hit.page = 1;
+    known.push(hit);
+  }
+}
+
+function attachGapTitles(hits: { title: string }[]) {
+  const nums = hits.map((hit) => chapterIndex(hit.title));
+  for (let i = 0; i < hits.length; i++) {
+    if (nums[i]) continue;
+    const prev = [...nums.slice(0, i)].reverse().find((n) => n);
+    const next = nums.slice(i + 1).find((n) => n);
+    if (!prev || next !== prev + 2) continue;
+    if (hits[i].title.length > 90 || /[.?!]/.test(hits[i].title)) continue;
+    if (/^c\W*h?apter\b/i.test(hits[i].title) && hits[i].title.length < 24) continue;
+    hits[i].title = `Chapter ${prev + 1} ${hits[i].title}`;
+    nums[i] = prev + 1;
+  }
+}
+
 function contentsOutline(lines: Line[], printed: PrintedPages, lexicon: WordList | null): { items: OutlineItem[]; drop: Set<Line> } {
   const empty = { items: [] as OutlineItem[], drop: new Set<Line>() };
   const ordered = [...lines].sort((a, b) => a.page - b.page || b.y - a.y);
@@ -330,73 +501,54 @@ function contentsOutline(lines: Line[], printed: PrintedPages, lexicon: WordList
   type Hit = { line: Line; title: string; page: number; file: number };
   const hits: Hit[] = [];
   const head = ordered.find((line) => line.page <= 40 && CONTENTS_HEAD.test(line.text.trim()));
-  const span = head ? { start: head.page, end: head.page + 14 } : null;
+  const span = head ? { start: head.page, end: head.page + 36 } : null;
   const inSpan = (line: Line) => !!span && line.page >= span.start && line.page <= span.end;
   const stitched = span ? stitchContents(ordered.filter(inSpan)) : [];
-  const chapterSeen = stitched.filter((group) => /^chapter\s+\d+\b/i.test(group.text)).length;
-  const chapterKept = stitched.filter((group) => /^chapter\s+\d+\b/i.test(group.text) && endsWithPage(group.text)).length;
-  if (span && chapterSeen >= 4 && chapterKept < chapterSeen - 1) {
-    const drop = new Set<Line>();
-    const byPage = new Map<number, Line[]>();
-    for (const line of ordered) {
-      if (!inSpan(line)) continue;
-      const list = byPage.get(line.page);
-      if (list) list.push(line);
-      else byPage.set(line.page, [line]);
-    }
-    for (let page = span.start; page <= span.end; page++) {
-      const list = byPage.get(page) || [];
-      if (!list.length) continue;
-      const entries = list.filter((line) => contentsEntry(line) || CONTENTS_HEAD.test(line.text.trim())).length;
-      const prose = list.filter((line) => /[a-z]{4}/.test(line.text) && line.text.trim().length > 60).length;
-      const opened = list.some((line) => {
-        const text = line.text.trim();
-        return line.h >= 14 && /^(?:foreword|preface|prologue|introduction|part\s+[ivxlcdm\d]|appendix\b|chapter\s+)/i.test(text);
-      });
-      if (opened && page !== span.start) break;
-      if (entries >= 3 || (page <= span.start + 5 && prose < 2 && list.length >= 8)) {
-        for (const line of list) drop.add(line);
-        continue;
+  const consider = (line: Line, text: string, joined: boolean) => {
+    const found = allEntries({ ...line, text });
+    if (!found.length) {
+      const titled = joined ? untitledChapter(text) : "";
+      if (titled) hits.push({ line, title: spaceChapter(titled), page: 0, file: line.page });
+      else if (/^(?:bibliography|index|glossary)\b/i.test(text) && text.length < 40) {
+        hits.push({ line, title: text.replace(/\s+/g, " ").trim(), page: 0, file: line.page });
       }
-      if (opened || (page !== span.start && prose >= 2)) break;
-      if (entries >= 1) {
-        for (const line of list) drop.add(line);
-        continue;
-      }
-      break;
+      return;
     }
-    return { items: [], drop };
-  }
-  const consider = (line: Line, text: string) => {
-    for (const found of allEntries({ ...line, text })) {
-      const page = fileForLabel(printed, found.token, maxPage);
+    for (const entry of found) {
+      const page = fileForLabel(printed, entry.token, maxPage);
       if (!page || page === line.page) continue;
-      if (lexicon && !knownTitle(found.title, lexicon)) continue;
-      hits.push({ line, title: found.title.slice(0, 180), page, file: line.page });
+      if (lexicon && !knownTitle(entry.title, lexicon)) continue;
+      hits.push({ line, title: spaceChapter(entry.title.slice(0, 180)), page, file: line.page });
     }
   };
-  for (const group of stitched) consider(group.lines[0], group.text);
-  for (const line of ordered) {
-    if (inSpan(line)) continue;
-    consider(line, line.text);
+  repairChapterLabels(stitched);
+  for (const group of stitched) consider(group.lines[0], group.text, group.lines.length > 1);
+  if (!span) {
+    for (const line of ordered) consider(line, line.text, false);
   }
+  placeMissingPages(hits);
+  attachGapTitles(hits);
+  const orderedHits = orderContentsHits(hits);
+  const numbered = chapterContents(orderedHits);
   const runs: Hit[][] = [];
-  for (let i = 0; i < hits.length; i++) {
+  if (!numbered) {
+  for (let i = 0; i < orderedHits.length; i++) {
     const run: Hit[] = [];
     let last = 0;
-    for (let j = i; j < hits.length && hits[j].file <= hits[i].file + 12; j++) {
-      if (hits[j].page < last) continue;
-      if (run.some((item) => item.title === hits[j].title)) continue;
-      run.push(hits[j]);
-      last = hits[j].page;
+    for (let j = i; j < orderedHits.length && orderedHits[j].file <= orderedHits[i].file + 36; j++) {
+      if (orderedHits[j].page < last) continue;
+      if (run.some((item) => item.title === orderedHits[j].title)) continue;
+      run.push(orderedHits[j]);
+      last = orderedHits[j].page;
     }
     const pages = new Set(run.map((item) => item.page));
     if (run.length >= 3 && pages.size >= 2) runs.push(run);
   }
   if (!runs.length) return empty;
+  }
   const front = runs.filter((run) => run[0].file <= Math.max(30, maxPage * 0.35));
   const pool = front.length ? front : runs;
-  const best = pool.reduce((a, b) => (b.length > a.length ? b : a));
+  const best = numbered || pool.reduce((a, b) => (b.length > a.length ? b : a));
   const drop = new Set(best.map((item) => item.line));
   const files = new Set(best.map((item) => item.file));
   for (const line of ordered) {
@@ -405,7 +557,7 @@ function contentsOutline(lines: Line[], printed: PrintedPages, lexicon: WordList
     if (CONTENTS_HEAD.test(text) || /^index$/i.test(text)) drop.add(line);
   }
   return {
-    items: best.slice(0, 80).map((item) => ({ label: item.title, page: item.page, children: [] })),
+    items: best.slice(0, 400).map((item) => ({ label: item.title, page: item.page, children: [] })),
     drop,
   };
 }
@@ -480,7 +632,7 @@ function printedContentsLines(lines: Line[]) {
   let kept = 0;
   let misses = 0;
   for (const ln of ordered) {
-    if (ln.page < start.page || ln.page > start.page + 6) continue;
+    if (ln.page < start.page || ln.page > start.page + 36) continue;
     if (ln === start || (ln.page === start.page && ln.y >= start.y)) continue;
     const text = ln.text.trim();
     if (!text) continue;
@@ -768,15 +920,16 @@ function tocOf(chapters: Folio["chapters"]): TocNode[] {
 
 function withOutline(paras: Para[], outline: OutlineItem[], title: string, printed: PrintedPages) {
   const chapters: Folio["chapters"] = [];
-  const first = outline[0].page || 1;
+  const starts = outline.map((item) => item.page || 0).filter((page) => page > 0).sort((a, b) => a - b);
+  const first = starts[0] || 1;
   const front = paras.filter((p) => p.group[0].page < first);
   if (front.length) {
     const ch = pushChapter(chapters, "Front matter", printed.label(front[0].group[0].page), front[0].group[0].page);
     for (const p of front) ch.blocks.push(bodyBlock(p, printed));
   }
-  outline.forEach((item, index) => {
+  outline.forEach((item) => {
     const start = item.page || 1;
-    const end = outline[index + 1]?.page ?? Infinity;
+    const end = starts.find((page) => page > start) ?? Infinity;
     const ch = pushChapter(chapters, item.label, printed.label(start), start);
     const seen = new Set<string>();
     const children = item.children.filter((c) => c.page && c.page >= start && c.page < end && c.page !== start);
@@ -803,23 +956,140 @@ function withOutline(paras: Para[], outline: OutlineItem[], title: string, print
 }
 
 function knownTitle(title: string, lexicon: WordList) {
-  const words = title.toLowerCase().match(/[a-z]{3,}/g) || [];
+  const words = (title.match(/[A-Za-z'’]+/g) || []).filter((word) => word.replace(/[^A-Za-z]/g, "").length >= 3);
   if (!words.length) return false;
-  let known = 0;
+  let dictionary = 0;
+  let names = 0;
   for (const word of words) {
-    const ok = lexicon.has(word) || (word.length > 4 && word.endsWith("s") && lexicon.has(word.slice(0, -1)));
-    if (!ok && word.length >= 8) return false;
-    if (ok) known++;
+    const lower = word.toLowerCase();
+    const ok = lexicon.has(lower) || (lower.length > 4 && lower.endsWith("s") && lexicon.has(lower.slice(0, -1)));
+    if (ok) {
+      dictionary++;
+      continue;
+    }
+    if (/^[A-Z][a-z'’-]+$/.test(word)) {
+      names++;
+      continue;
+    }
+    if (lower.length >= 8) return false;
   }
-  return known >= 1 && known * 4 >= words.length * 3;
+  const known = dictionary + Math.min(names, Math.max(dictionary, names));
+  if (dictionary === 0 && names >= 2 && names === words.length) return true;
+  return dictionary >= 1 && known * 4 >= words.length * 3;
+}
+
+function spaceChapter(text: string) {
+  return text.replace(/\b(chapter|book)\s*(\d+)\b/gi, (_full, word: string, n: string) => {
+    const head = word[0].toUpperCase() + word.slice(1).toLowerCase();
+    return `${head} ${n}`;
+  });
+}
+
+/** Left column, then right, so a two-column contents list keeps its page order. */
+function orderContentsHits<T extends { line: Line; file: number }>(hits: T[]): T[] {
+  const byFile = new Map<number, T[]>();
+  for (const hit of hits) {
+    const list = byFile.get(hit.file) || [];
+    list.push(hit);
+    byFile.set(hit.file, list);
+  }
+  const out: T[] = [];
+  for (const file of [...byFile.keys()].sort((a, b) => a - b)) {
+    const list = byFile.get(file) || [];
+    const xs = list.map((hit) => hit.line.x0).sort((a, b) => a - b);
+    const spread = xs.length ? xs[xs.length - 1] - xs[0] : 0;
+    const byRow = (a: T, b: T) => b.line.y - a.line.y || a.line.x0 - b.line.x0;
+    if (spread < 100 || list.length < 6) {
+      out.push(...list.sort(byRow));
+      continue;
+    }
+    const mid = xs[Math.floor(xs.length / 2)];
+    const left = list.filter((hit) => hit.line.x0 < mid).sort(byRow);
+    const right = list.filter((hit) => hit.line.x0 >= mid).sort(byRow);
+    if (left.length < 3 || right.length < 3) out.push(...list.sort(byRow));
+    else out.push(...left, ...right);
+  }
+  return out;
+}
+
+function chapterIndex(text: string) {
+  const match = /^(?:chapter|book)\s*(\d{1,4})\b/i.exec(text.replace(/\s+/g, " ").trim());
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * A two-column contents list is not one rising page count.
+ * Read across the row and the right-hand page is higher, so the longest
+ * rising stretch can be the middle of the book. Chapter numbers keep the whole list.
+ */
+function chapterContents(hits: { line: Line; title: string; page: number; file: number }[]): typeof hits | null {
+  type Hit = (typeof hits)[number];
+  const tagged = hits.filter((hit) => chapterIndex(hit.title));
+  if (tagged.length < 8) return null;
+  const earliest = Math.min(...tagged.map((hit) => hit.file));
+  const pool = hits.filter((hit) => hit.file >= earliest && hit.file <= earliest + 20);
+  if (pool.filter((hit) => chapterIndex(hit.title)).length < 8) return null;
+  const groups = new Map<number, Hit[]>();
+  const leading: Hit[] = [];
+  const closing: Hit[] = [];
+  for (const hit of pool) {
+    const n = chapterIndex(hit.title);
+    if (n) {
+      const title = hit.title.replace(/\s+(?:chapter|book)\s+\d+\b[\s\S]*$/i, "").trim();
+      const clean = title === hit.title ? hit : { ...hit, title };
+      if (!groups.has(n)) groups.set(n, [clean]);
+      continue;
+    }
+    if (groups.size) {
+      if (/^(?:bibliography|index|glossary|notes|appendix)\b/i.test(hit.title)) closing.push(hit);
+      continue;
+    }
+    if (leading.some((item) => item.title === hit.title)) continue;
+    if (hit.title.length > 80 || /[.?!]/.test(hit.title) || hit.title.split(/\s+/).length > 12) continue;
+    leading.push(hit);
+  }
+  const numbers = [...groups.keys()].sort((a, b) => a - b);
+  if (numbers.length < 8) return null;
+  const out: Hit[] = [];
+  const firstPage = groups.get(numbers[0])![0].page;
+  for (const hit of leading) if (hit.page <= firstPage) out.push(hit);
+  for (const n of numbers) out.push(...groups.get(n)!);
+  out.push(...closing);
+  return out;
+}
+
+/** A printed list that stops while the book keeps opening later chapters. */
+function contentsIncomplete(items: OutlineItem[], lines: Line[], drop: Set<Line>) {
+  if (items.length < 4) return false;
+  const listed = new Set<number>();
+  for (const item of items) {
+    const n = chapterIndex(item.label);
+    if (n) listed.add(n);
+  }
+  const body = new Set<number>();
+  for (const line of lines) {
+    if (drop.has(line)) continue;
+    const text = line.text.replace(/\s+/g, " ").trim();
+    if (/[.\u00b7…]{4,}/.test(text) || text.length > 90) continue;
+    const n = chapterIndex(text);
+    if (n) body.add(n);
+  }
+  if (body.size < 8) return false;
+  let extra = 0;
+  for (const n of body) if (!listed.has(n)) extra++;
+  const listedMax = listed.size ? Math.max(...listed) : 0;
+  const bodyMax = Math.max(...body);
+  return extra >= 8 || bodyMax >= listedMax + 8;
 }
 
 const CHAPTER_LABEL =
-  /^(?:chapter|book)\s+(?:\d{1,2}|[ivxlcdm]{1,6}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\s*[:.]?\s*$/i;
+  /^(?:chapter|book)\s+(?:\d{1,4}|[ivxlcdm]{1,6}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\s*[:.]?\s*$/i;
 const SECTION_LABEL = /^(?:[A-Z]|[ivxlcdm]{1,5})\.\s+\S/;
 
 function chapterLabel(text: string) {
-  return CHAPTER_LABEL.test(text.replace(/\s+/g, " ").trim());
+  const title = text.replace(/\s+/g, " ").trim();
+  if (/^(?:chapter|book)\s*\d{1,4}\s*[:.]?\s*$/i.test(title)) return true;
+  return CHAPTER_LABEL.test(title);
 }
 
 function headingKind(text: string): "chapter" | "section" | "title" | null {
@@ -828,7 +1098,18 @@ function headingKind(text: string): "chapter" | "section" | "title" | null {
   if (chapterLabel(title)) return "chapter";
   if (/^part\s+(?:[ivxlcdm]{1,6}|\d{1,2})\s*[:.]?\s*$/i.test(title)) return "chapter";
   if (/^appendix\s+(?:\d{1,2}|[ivxlcdm]{1,6})\s*[:.]?\s*$/i.test(title)) return "chapter";
-  if (/^(?:chapter|book)\s+\S/i.test(title)) return null;
+  if (/^(?:chapter|book)\s+\S/i.test(title)) {
+    const rest = title.replace(/^(?:chapter|book)\s*\d{1,4}\b\s*[-–—:.]?\s*/i, "").trim();
+    if (rest && rest !== title && !/[.?!]["']?$/.test(rest)) {
+      const words = rest.split(/\s+/);
+      const small = new Set(["a", "an", "and", "but", "or", "nor", "of", "the", "in", "on", "at", "to", "for", "by", "as", "from", "with", "into", "over", "upon"]);
+      const titled =
+        words.length <= 14 &&
+        words.every((word, index) => (index > 0 && small.has(word.toLowerCase())) || /^[A-Z0-9][A-Za-z0-9'’.,:?/\u2013\u2014-]*$/.test(word));
+      if (titled || (words.length <= 14 && allCapsLine(rest))) return "chapter";
+    }
+    return null;
+  }
   if (SECTION_LABEL.test(title) && !/^[A-Z]\.\s*[A-Z]\./.test(title)) return "section";
   const words = title.split(/\s+/);
   if (words.length > 14) return null;
@@ -915,7 +1196,7 @@ function contentsDamaged(lines: Line[], lexicon: WordList) {
   }
   if (!head) return false;
   for (const line of lines) {
-    if (line.page < head || line.page > head + 12) continue;
+    if (line.page < head || line.page > head + 36) continue;
     const found = allEntries(line);
     if (!found.length) continue;
     const stat = byPage.get(line.page) || { n: 0, ok: 0 };
@@ -1124,7 +1405,7 @@ function withHeadings(paras: Para[], title: string, bodyH: number, printed: Prin
       const titleLines = [...titleAt];
       if (appendixAt != null) titleLines.push(appendixAt);
       const subtitle = titleLines.length ? softenStack(titleLines.map((j) => textOf(paras[j]))) : "";
-      open(subtitle ? `${softenHeading(text)}. ${subtitle}` : softenHeading(text), p);
+      open(spaceChapter(subtitle ? `${softenHeading(text)}. ${subtitle}` : softenHeading(text)), p);
       for (const j of titleLines) skip.add(j);
       let pending = "";
       for (const j of follow) {
@@ -1212,7 +1493,8 @@ export function assembleFolio(
   const printed = detectPrinted(source);
   const lexicon = options.lexicon || null;
   const bookmark = normalizeOutline(options.outline || []);
-  const numbered = bookmark.length >= 2 ? { items: [] as OutlineItem[], drop: new Set<Line>() } : contentsOutline(source, printed, lexicon);
+  const trustOutline = outlineCoversStart(bookmark);
+  const numbered = trustOutline ? { items: [] as OutlineItem[], drop: new Set<Line>() } : contentsOutline(source, printed, lexicon);
   let damaged = "";
   if (lexicon && contentsDamaged(source, lexicon)) {
     const span = scrapContents(source);
@@ -1223,7 +1505,14 @@ export function assembleFolio(
       damaged = "The printed contents could not be read, so the chapters follow the headings.";
     }
   }
-  const titled = bookmark.length >= 2 || numbered.items.length >= 2 ? { items: [] as OutlineItem[], drop: new Set<Line>() } : titleOutline(source);
+  if (numbered.items.length >= 4 && contentsIncomplete(numbered.items, source, numbered.drop)) {
+    const pages = new Set<number>();
+    for (const line of numbered.drop) pages.add(line.page);
+    for (const line of source) if (pages.has(line.page)) numbered.drop.add(line);
+    numbered.items = [];
+    damaged = "The printed contents missed later chapters, so the chapters follow the headings.";
+  }
+  const titled = trustOutline || numbered.items.length >= 2 ? { items: [] as OutlineItem[], drop: new Set<Line>() } : titleOutline(source);
   const skipContents = printedContentsLines(source);
   let headers = 0;
   const kept: Line[] = [];
@@ -1294,9 +1583,9 @@ export function assembleFolio(
     })
     .filter((p) => p.table || p.runs.some((r) => typeof r === "string" && r.replace(/[^A-Za-z]/g, "").length > 1));
   if (!paras.length) throw new Error(options.emptyMessage);
-  const chosen = bookmark.length >= 2 ? bookmark : numbered.items.length >= 2 ? numbered.items : titled.items;
+  const chosen = trustOutline ? bookmark : numbered.items.length >= 2 ? numbered.items : titled.items;
   options.onStatus?.(
-    bookmark.length >= 2
+    trustOutline
       ? `Contents from the file's own list, ${bookmark.length} chapters`
       : numbered.items.length >= 2
         ? `Contents from the titles and page numbers, ${numbered.items.length} chapters`

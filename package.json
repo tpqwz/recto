@@ -1,5 +1,6 @@
 {
-  "name": "app-builder-workspace",
+  "name": "recto",
+  "version": "0.1.0-alpha",
   "private": true,
   "sideEffects": false,
   "type": "module",

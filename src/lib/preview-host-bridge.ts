@@ -270,6 +270,65 @@ export function installPreviewHostBridge(
   };
 }
 
+/**
+ * A long open looks idle to the preview, which then goes to sleep.
+ * While a book is opening, say the page is still here and keep the screen on.
+ */
+export function holdPreviewOpen(): () => void {
+  if (typeof window === "undefined") return () => {};
+  let gone = false;
+  let lock: { release: () => Promise<void> } | null = null;
+  const beat = () => {
+    if (gone) return;
+    const parentOrigin = resolveCurrentEmbedderOrigin();
+    if (!parentOrigin) return;
+    window.parent.postMessage(
+      {
+        channel: PREVIEW_BRIDGE_CHANNEL,
+        version: PREVIEW_BRIDGE_VERSION,
+        type: "ready",
+      },
+      parentOrigin,
+    );
+    window.parent.postMessage(
+      {
+        channel: PREVIEW_BRIDGE_CHANNEL,
+        version: PREVIEW_BRIDGE_VERSION,
+        type: "location",
+        path: window.location.pathname || "/",
+        search: window.location.search,
+        hash: window.location.hash,
+      },
+      parentOrigin,
+    );
+  };
+  const claim = () => {
+    if (gone || document.visibilityState === "hidden") return;
+    const wakeLock = (navigator as Navigator & { wakeLock?: { request: (kind: "screen") => Promise<{ release: () => Promise<void> }> } }).wakeLock;
+    if (!wakeLock) return;
+    void wakeLock
+      .request("screen")
+      .then((sentinel) => {
+        if (gone) void sentinel.release();
+        else lock = sentinel;
+      })
+      .catch(() => {});
+  };
+  beat();
+  claim();
+  const timer = window.setInterval(beat, 1000);
+  const onVisible = () => {
+    if (document.visibilityState === "visible") claim();
+  };
+  document.addEventListener("visibilitychange", onVisible);
+  return () => {
+    gone = true;
+    window.clearInterval(timer);
+    document.removeEventListener("visibilitychange", onVisible);
+    void lock?.release().catch(() => {});
+  };
+}
+
 /** Collect static path patterns from a TanStack route tree (best-effort). */
 export function collectRoutePathsFromTree(routeTree: unknown): string[] {
   const paths = new Set<string>();

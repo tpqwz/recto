@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent 
 import { BookOpen, ChevronDown, Download, Menu, Search, Settings, X } from "lucide-react";
 import book from "@/data/book.json";
 import { previewPathPrefix } from "@/lib/preview-path-prefix";
+import { holdPreviewOpen } from "@/lib/preview-host-bridge";
 import { folioFromFile, runPage, type Block, type Folio, type Run, type TocNode } from "@/folio/from-pdf";
 import { republish } from "@/folio/assemble";
 import { PassageEditor, SelectionMenu, type SelectionPick } from "@/folio/editor";
@@ -148,6 +149,12 @@ function Desk() {
   const [active, setActive] = useState("title-page");
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState("");
+  const working = busy !== "";
+  const stayAwake = working || (open && !isSampleBook(folio));
+  useEffect(() => {
+    if (!stayAwake) return;
+    return holdPreviewOpen();
+  }, [stayAwake]);
   const [log, setLog] = useState<string[]>([]);
   const [logOpen, setLogOpen] = useState(false);
   const logBox = useRef<HTMLDivElement>(null);

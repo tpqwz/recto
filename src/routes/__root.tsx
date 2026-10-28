@@ -8,8 +8,8 @@ export const Route = createRootRoute({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Recto — The Dhammapada" },
-      { name: "description", content: "A reading edition of F. Max Müller’s 1881 Dhammapada, a public-domain translation, with the contents and page numbers linked." },
+      { title: "Recto" },
+      { name: "description", content: "A reading desk for PDF and DjVu, with the contents and the page numbers kept." },
       { name: "theme-color", content: "#221e1a" },
     ],
     links: [

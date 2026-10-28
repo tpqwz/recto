@@ -1,4 +1,8 @@
 node_modules
 artifacts
 screenshots
+attachments
 .DS_Store
+.recto-live.txt
+.recto-peek.py
+.recto-watch.py

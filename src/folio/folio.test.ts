@@ -220,6 +220,34 @@ describe("opened folio", () => {
     assert.match(contentsHtml, new RegExp(`href="${linked[1]?.id}\\.xhtml#${linked[1]?.id}"`));
   });
 
+  it("keeps a hundred contents entries, including a proper name", () => {
+    const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
+    g.URL = g.URL || {};
+    g.URL.createObjectURL = () => "blob:folio-test";
+    const words = new Set("the loan history chapter".split(" "));
+    const lines: Line[] = [line("i", 1, 20), line("A preface sentence stays here.", 1, 400), line("Contents", 2, 760)];
+    for (let n = 1; n <= 100; n++) {
+      const title = n === 40 ? "The Rothschild Loan" : `History Chapter ${n}`;
+      const file = 2 + Math.floor((n - 1) / 25);
+      lines.push(line(`${title} .......... ${n}`, file, 730 - ((n - 1) % 25) * 22));
+      const body = 10 + n;
+      lines.push(line(String(n), body, 20));
+      lines.push(line(`The body of chapter ${n} stays here.`, body, 400));
+    }
+    const folio = assembleFolio(lines, {
+      title: "Long",
+      subtitle: "",
+      sourceName: "long.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      lexicon: { has: (word) => words.has(word) },
+    });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.includes("The Rothschild Loan"), true);
+    assert.equal(labels.includes("History Chapter 100"), true);
+    assert.equal(labels.filter((label) => label === "The Rothschild Loan" || /^History Chapter \d+$/.test(label)).length, 100);
+  });
+
   it("reads a two-column page down each column", () => {
     const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
     g.URL = g.URL || {};
@@ -503,6 +531,209 @@ describe("opened folio", () => {
       .join(" ");
     assert.match(prose, /words of sealing prayer/);
     assert.doesNotMatch(prose, /Sealing Prayer 3 Sealing Prayer 3/);
+  });
+
+  it("keeps a proper name and spaces a glued chapter number", () => {
+    const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
+    g.URL = g.URL || {};
+    g.URL.createObjectURL = () => "blob:folio-test";
+    const words = new Set("the history of and".split(" "));
+    const lines: Line[] = [line("Contents", 2, 760)];
+    const titles = ["The History", "St. Bernardine of Siena", "Chapter2 Pagan Economics"];
+    titles.forEach((title, index) => {
+      const page = 3 + index;
+      lines.push(line(`${title} .......... ${page}`, 2, 700 - index * 24));
+      lines.push(line(String(page), page, 20));
+      lines.push(line(`The body of entry ${index} stays here.`, page, 400));
+    });
+    const folio = assembleFolio(lines, {
+      title: "Names",
+      subtitle: "",
+      sourceName: "names.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      lexicon: { has: (word) => words.has(word) },
+    });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.includes("St. Bernardine of Siena"), true);
+    assert.equal(labels.includes("Chapter 2 Pagan Economics"), true);
+  });
+
+  it("reads both columns of a contents line", () => {
+    const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
+    g.URL = g.URL || {};
+    g.URL.createObjectURL = () => "blob:folio-test";
+    const left = ["The Medici Bank", "Moral Decay", "The Turning"];
+    const right = ["Jakob the Rich", "The London Branch", "Bread and Circuses"];
+    const lines: Line[] = [line("Contents", 2, 760)];
+    left.forEach((title, index) => {
+      const page = 3 + index;
+      const later = 8 + index;
+      lines.push(line(`${title} .......... ${page} ${right[index]} .......... ${later}`, 2, 700 - index * 24));
+      lines.push(line(String(page), page, 20));
+      lines.push(line(`The body of ${title.toLowerCase()} stays.`, page, 400));
+      lines.push(line(String(later), later, 20));
+      lines.push(line(`The body of ${right[index].toLowerCase()} stays.`, later, 400));
+    });
+    const folio = assembleFolio(lines, { title: "Columns", subtitle: "", sourceName: "toc-columns.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.includes("Jakob the Rich"), true);
+    assert.equal(labels.includes("The London Branch"), true);
+    assert.equal(labels.includes("Bread and Circuses"), true);
+    assert.equal(labels.includes("The Medici Bank"), true);
+  });
+
+  it("does not let a short contents list swallow later chapters", () => {
+    const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
+    g.URL = g.URL || {};
+    g.URL.createObjectURL = () => "blob:folio-test";
+    const lines: Line[] = [line("Contents", 2, 760)];
+    for (let n = 1; n <= 5; n++) {
+      lines.push(line(`Chapter ${n} Early .......... ${n}`, 2, 720 - n * 22));
+      const page = 10 + n;
+      lines.push(line(String(n), page, 20));
+      lines.push(line(`Chapter ${n}`, page, 700, { h: 18 }));
+      lines.push(line(`The body of early chapter ${n} stays.`, page, 640));
+    }
+    for (let n = 6; n <= 20; n++) {
+      const page = 10 + n;
+      lines.push(line(String(n), page, 20));
+      lines.push(line(`Chapter ${n} Later Title`, page, 700, { h: 18 }));
+      lines.push(line(`The body of later chapter ${n} stays.`, page, 640));
+    }
+    const folio = assembleFolio(lines, { title: "Long", subtitle: "", sourceName: "gappy.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.includes("Chapter 20 Later Title"), true);
+    assert.equal(labels.includes("Chapter 6 Later Title"), true);
+    const last = folio.chapters[folio.chapters.length - 1];
+    assert.equal(last.title, "Chapter 20 Later Title");
+    const prose = last.blocks
+      .flatMap((block) => block.runs || [])
+      .filter((run) => typeof run === "string")
+      .join(" ");
+    assert.match(prose, /later chapter 20/);
+    assert.doesNotMatch(prose, /later chapter 6/);
+  });
+
+  it("keeps every numbered chapter when the columns are read across", () => {
+    const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
+    g.URL = g.URL || {};
+    g.URL.createObjectURL = () => "blob:folio-test";
+    const lines: Line[] = [line("Contents", 2, 760)];
+    for (let n = 1; n <= 40; n++) {
+      const y = 740 - n * 14;
+      const right = n + 40;
+      const leftPage = 10 + n;
+      const rightPage = 10 + right;
+      lines.push(line(`Chapter ${n} - Early Title .......... ${leftPage}`, 2, y, { x0: 72, x1: 250 }));
+      lines.push(line(`Chapter ${right} - Later Title .......... ${rightPage}`, 2, y, { x0: 120, x1: 300 }));
+      for (const page of [leftPage, rightPage]) {
+        lines.push(line(String(page), page, 20));
+        lines.push(line(`The body of file page ${page} stays.`, page, 400));
+      }
+    }
+    const folio = assembleFolio(lines, { title: "Columns", subtitle: "", sourceName: "wide.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.includes("Chapter 1 - Early Title"), true);
+    assert.equal(labels.includes("Chapter 40 - Early Title"), true);
+    assert.equal(labels.includes("Chapter 41 - Later Title"), true);
+    assert.equal(labels.includes("Chapter 80 - Later Title"), true);
+    assert.equal(labels.filter((label) => /^Chapter \d+ - /.test(label)).length, 80);
+    const first = labels.find((label) => /^Chapter \d+ - /.test(label));
+    assert.equal(first, "Chapter 1 - Early Title");
+  });
+
+  it("keeps chapters whose pages fall outside the numbered footers", () => {
+    const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
+    g.URL = g.URL || {};
+    g.URL.createObjectURL = () => "blob:folio-test";
+    const lines: Line[] = [line("Contents", 2, 760)];
+    for (let file = 1; file <= 60; file++) {
+      if (file >= 40 && file <= 55) lines.push(line(String(file - 20), file, 20));
+      lines.push(line(`Body sentence on file ${file} stays here.`, file, 400));
+    }
+    for (let n = 1; n <= 30; n++) {
+      lines.push(line(`Chapter ${n} - Title .......... ${5 + n}`, 2, 740 - n * 16));
+    }
+    const folio = assembleFolio(lines, { title: "Range", subtitle: "", sourceName: "range.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.includes("Chapter 1 - Title"), true);
+    assert.equal(labels.includes("Chapter 14 - Title"), true);
+    assert.equal(labels.includes("Chapter 30 - Title"), true);
+    assert.equal(labels.filter((label) => /^Chapter \d+ - Title$/.test(label)).length, 30);
+  });
+
+  it("orders chapters by number when the later ones were read first", () => {
+    const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
+    g.URL = g.URL || {};
+    g.URL.createObjectURL = () => "blob:folio-test";
+    const lines: Line[] = [line("Contents", 2, 760)];
+    for (let n = 72; n <= 87; n++) lines.push(line(`Chapter ${n} - Later .......... ${100 + n}`, 2, 700 - (n - 72)));
+    for (let n = 1; n <= 71; n++) lines.push(line(`Chapter ${n} - Early .......... ${300 + n}`, 2, 500 - n));
+    const pages = new Set<number>();
+    for (let n = 72; n <= 87; n++) pages.add(100 + n);
+    for (let n = 1; n <= 71; n++) pages.add(300 + n);
+    for (const page of pages) {
+      lines.push(line(String(page), page, 20));
+      lines.push(line(`The body of page ${page} stays.`, page, 400));
+    }
+    const folio = assembleFolio(lines, { title: "Order", subtitle: "", sourceName: "order.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    const first = labels.find((label) => /^Chapter \d+ /.test(label));
+    assert.equal(first, "Chapter 1 - Early");
+    assert.ok(labels.indexOf("Chapter 1 - Early") < labels.indexOf("Chapter 72 - Later"));
+    assert.ok(labels.indexOf("Chapter 71 - Early") < labels.indexOf("Chapter 72 - Later"));
+    assert.equal(labels.includes("Chapter 87 - Later"), true);
+  });
+
+  it("splits two chapters on one line and keeps the year in the title", () => {
+    const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
+    g.URL = g.URL || {};
+    g.URL.createObjectURL = () => "blob:folio-test";
+    const lines: Line[] = [line("Contents", 2, 760)];
+    lines.push(line("Chapter 1 The Ciompi Rebellion of 1378 12 Chapter 2 Pagan Economics 28", 2, 720));
+    for (let n = 3; n <= 12; n++) lines.push(line(`Chapter ${n} - Title .......... ${30 + n}`, 2, 700 - n));
+    for (let page = 12; page <= 50; page++) {
+      lines.push(line(String(page), page, 20));
+      lines.push(line(`The body of page ${page} stays.`, page, 400));
+    }
+    const folio = assembleFolio(lines, { title: "Split", subtitle: "", sourceName: "split.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.includes("Chapter 1 The Ciompi Rebellion of 1378"), true);
+    assert.equal(labels.includes("Chapter 2 Pagan Economics"), true);
+    assert.equal(labels.some((label) => /Chapter 1[\s\S]*Chapter 2/.test(label)), false);
+    assert.ok(labels.indexOf("Chapter 1 The Ciompi Rebellion of 1378") < labels.indexOf("Chapter 12 - Title"));
+  });
+
+  it("lifts chapters that the file nested under the last chapter", () => {
+    const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
+    g.URL = g.URL || {};
+    g.URL.createObjectURL = () => "blob:folio-test";
+    const lines: Line[] = [line("A sentence of the book stays here.", 1, 400)];
+    const outline = [];
+    for (let n = 72; n <= 87; n++) {
+      outline.push({
+        label: `Chapter ${n} - Later`,
+        page: 100 + n,
+        children:
+          n === 87
+            ? Array.from({ length: 20 }, (_, i) => ({ label: `Chapter ${i + 1} - Early`, page: 300 + i, children: [] }))
+            : [],
+      });
+    }
+    const folio = assembleFolio(lines, {
+      title: "Nested",
+      subtitle: "",
+      sourceName: "nested.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      outline,
+    });
+    const labels = folio.toc.map((item) => item.label);
+    assert.ok(labels.indexOf("Chapter 1 - Early") < labels.indexOf("Chapter 72 - Later"));
+    assert.ok(labels.indexOf("Chapter 20 - Early") < labels.indexOf("Chapter 72 - Later"));
+    const last = folio.toc.find((item) => item.label === "Chapter 87 - Later");
+    assert.equal(last?.children.some((child) => /Chapter 1/.test(child.label)), false);
   });
 });
 
