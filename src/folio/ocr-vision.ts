@@ -68,12 +68,12 @@ async function readRuntime(
   const dtype =
     device === "wasm"
       ? "fp32"
-      : {
+      : ({
           embed_tokens: fp16 ? "fp16" : "fp32",
           vision_encoder: fp16 ? "fp16" : "fp32",
           encoder_model: "q4",
           decoder_model_merged: "q4",
-        };
+        } as const);
   const model = await Florence2ForConditionalGeneration.from_pretrained(MODEL, {
     device,
     dtype,

@@ -124,6 +124,60 @@ function filePagesOf(lines: PageLine[]) {
   return [...pages].sort((a, b) => a - b);
 }
 
+/** Page numbers that keep step with the file, even after they move from the footer to the header. */
+function agreedArabic(obs: { file: number; value: number; weight: number }[]) {
+  const byFile = new Map<number, { file: number; value: number; weight: number }[]>();
+  for (const ob of obs) {
+    const list = byFile.get(ob.file) || [];
+    list.push(ob);
+    byFile.set(ob.file, list);
+  }
+  const chosen: { file: number; value: number; weight: number }[] = [];
+  for (const file of [...byFile.keys()].sort((a, b) => a - b)) {
+    const options = byFile.get(file) || [];
+    let best = options[0];
+    let bestScore = -1;
+    for (const ob of options) {
+      let score = ob.weight;
+      for (const other of obs) {
+        if (other.file === file) continue;
+        const fileGap = other.file - file;
+        const valueGap = other.value - ob.value;
+        if (fileGap === 0 || Math.abs(fileGap) > 12) continue;
+        if (valueGap * fileGap > 0 && Math.abs(Math.abs(fileGap) - Math.abs(valueGap)) <= 2) score += other.weight;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        best = ob;
+      }
+    }
+    if (bestScore >= best.weight + 2) chosen.push(best);
+  }
+  return chosen;
+}
+
+function paintArabic(labels: Map<number, number | string>, chosen: { file: number; value: number }[]) {
+  const used = new Set([...labels.values()].map((label) => String(label)));
+  const put = (file: number, value: number) => {
+    if (value < 1 || labels.has(file)) return;
+    const key = String(value);
+    if (used.has(key)) return;
+    used.add(key);
+    labels.set(file, value);
+  };
+  for (let i = 0; i < chosen.length; i++) {
+    const a = chosen[i];
+    put(a.file, a.value);
+    const b = chosen[i + 1];
+    if (!b) continue;
+    const fileGap = b.file - a.file;
+    const valueGap = b.value - a.value;
+    if (fileGap > 1 && fileGap < 12 && fileGap === valueGap) {
+      for (let k = 1; k < fileGap; k++) put(a.file + k, a.value + k);
+    }
+  }
+}
+
 export function detectPrinted(lines: PageLine[]): PrintedPages {
   const files = filePagesOf(lines);
   const fallback: PrintedPages = { label: (filePage) => filePage };
@@ -133,7 +187,7 @@ export function detectPrinted(lines: PageLine[]): PrintedPages {
   const ownRoman = new Map<number, number>();
   for (const file of files) {
     const cands = lines
-      .filter((ln) => ln.page === file && ln.text.length < 72 && (ln.y > ln.pageH - 54 || ln.y < 36))
+      .filter((ln) => ln.page === file && ln.text.length < 72 && (ln.y > ln.pageH - 72 || ln.y < 80))
       .flatMap((ln) => candidates(ln.text));
     const seen = new Set<string>();
     for (const cand of cands) {
@@ -150,7 +204,22 @@ export function detectPrinted(lines: PageLine[]): PrintedPages {
   const arabic = winningOffset(arabicObs);
   const roman = winningOffset(romanObs);
   const labels = new Map<number, number | string>();
-  if (arabic) {
+  const chosen = agreedArabic(arabicObs);
+  if (chosen.length >= 4) {
+    const first = chosen[0].file;
+    const front = files.filter((file) => file < first);
+    const frontRoman = winningOffset(romanObs.filter((ob) => front.includes(ob.file)));
+    for (const file of front) {
+      if (frontRoman) {
+        const value = file - frontRoman.offset;
+        if (value >= 1) labels.set(file, toRoman(value));
+      } else {
+        const value = ownRoman.get(file);
+        if (value) labels.set(file, toRoman(value));
+      }
+    }
+    paintArabic(labels, chosen);
+  } else if (arabic) {
     const confirmed = arabicObs.filter((ob) => ob.file - ob.value === arabic.offset).map((ob) => ob.file);
     const first = Math.min(...confirmed);
     const last = Math.max(...confirmed);

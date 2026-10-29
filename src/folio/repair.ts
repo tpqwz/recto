@@ -132,7 +132,7 @@ function segmentToken(token: string, list: WordList) {
     const a = lower.slice(0, i);
     const b = lower.slice(i);
     if (!part(a) || !part(b)) continue;
-    if (STOP.has(a) || STOP.has(b) || (a.length >= 4 && b.length >= 4)) cands.push([a, b]);
+    if (STOP.has(a) || STOP.has(b) || (!capital && a.length >= 4 && b.length >= 4)) cands.push([a, b]);
   }
   for (let i = 2; i <= 4; i++) {
     const a = lower.slice(0, i);

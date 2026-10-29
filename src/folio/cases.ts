@@ -138,6 +138,98 @@ export function suppressTwins(lines: Line[]): { lines: Line[]; note: string } {
   return { lines: out, note };
 }
 
+function junkChar(ch: string) {
+  return /[\\^|~<>[\]{}#@=+`]/.test(ch);
+}
+
+/** A token from a drawing. A misspelled word that merely contains a caret stays. */
+function scrubToken(token: string) {
+  const chars = [...token];
+  let junk = 0;
+  let letters = 0;
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    const slash = ch === "/" && !(/\d/.test(chars[i - 1] || "") && /\d/.test(chars[i + 1] || ""));
+    if (junkChar(ch) || slash) junk += 1;
+    else if (/\p{L}/u.test(ch)) letters += 1;
+  }
+  if (!junk) return token;
+  if (junkChar(chars[0] || "") && letters < 8) return "";
+  if (junk >= 2 && junk > letters) return "";
+  return token;
+}
+
+function scrubPictureText(text: string) {
+  return text
+    .split(/(\s+)/)
+    .map((part) => (/^\s+$/.test(part) ? part : scrubToken(part)))
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function pictureShard(text: string) {
+  const words = text.match(/[A-Za-z]{4,}/g) || [];
+  const letters = (text.match(/\p{L}/gu) || []).length;
+  const junk = (text.match(/[\\^|~<>[\]{}#@=+`/]/g) || []).length;
+  if (!junk) return false;
+  if (words.length >= 2 && letters >= 12 && junk <= letters * 0.15) return false;
+  if (words.length >= 1 && letters >= 8 && junk <= 2) return false;
+  return junk >= 2 || letters < 8;
+}
+
+function wordish(text: string) {
+  const words = text.match(/[A-Za-z]{3,}/g) || [];
+  return words.length >= 1 && (text.match(/\p{L}/gu) || []).length >= 4;
+}
+
+/**
+ * Letters read off a drawing sit in the space beside a short line.
+ * The sentence itself continues in that hole. The side text does not.
+ */
+function quietPicture(lines: Line[]): { lines: Line[]; dropped: boolean } {
+  let dropped = false;
+  const kept: Line[] = [];
+  for (const line of lines) {
+    const text = scrubPictureText(line.text);
+    if (!text || pictureShard(text)) {
+      dropped = true;
+      continue;
+    }
+    if (text !== line.text) dropped = true;
+    kept.push(text === line.text ? line : { ...line, text });
+  }
+  const trimmed = kept.map((line) => {
+    const cells = line.cells;
+    if (!cells || cells.length < 2) return line;
+    let splitAt = -1;
+    for (let i = 0; i < cells.length - 1; i++) {
+      if (cells[i + 1].x0 - cells[i].x1 > Math.max(48, line.h * 3.5)) {
+        splitAt = i;
+        break;
+      }
+    }
+    if (splitAt < 0) return line;
+    const left = cells[splitAt];
+    const right = cells[splitAt + 1];
+    const below = [...kept]
+      .filter((other) => other !== line && other.y < line.y)
+      .sort((a, b) => b.y - a.y)
+      .find((other) => line.y - other.y < Math.max(line.h, other.h, 8) * 1.8);
+    if (!below || !wordish(below.text)) return line;
+    if (below.x0 < line.x0 + 12 || below.x0 > left.x1 + 30) return line;
+    if (right.x0 < below.x0 + 8) return line;
+    const leftText = scrubPictureText(cells.slice(0, splitAt + 1).map((cell) => cell.text).join(" "));
+    const rightText = cells.slice(splitAt + 1).map((cell) => cell.text).join(" ");
+    const leftLetters = (leftText.match(/\p{L}/gu) || []).length;
+    const rightLetters = (rightText.match(/\p{L}/gu) || []).length;
+    if (!leftText || !leftLetters || rightLetters > leftLetters * 1.8) return line;
+    dropped = true;
+    return { ...line, text: leftText, x1: left.x1, cells: cells.slice(0, splitAt + 1) };
+  });
+  return { lines: trimmed.filter((line) => line.text.trim()), dropped };
+}
+
 export function shapeLines(lines: Line[]): { lines: Line[]; note: string } {
   const byPage = new Map<number, Line[]>();
   for (const line of lines) {
@@ -150,10 +242,13 @@ export function shapeLines(lines: Line[]): { lines: Line[]; note: string } {
   let columns = 0;
   let tables = 0;
   let notes = 0;
+  let pictures = 0;
   const out: Line[] = [];
   for (const page of [...byPage.keys()].sort((a, b) => a - b)) {
     const pageLines = byPage.get(page) || [];
-    const split = splitNotes(pageLines, bodyH);
+    const quiet = quietPicture(pageLines);
+    if (quiet.dropped) pictures += 1;
+    const split = splitNotes(quiet.lines, bodyH);
     const ordered = orderColumns(split.body);
     if (ordered !== split.body) columns += 1;
     const lifted = liftTables(ordered);
@@ -168,6 +263,7 @@ export function shapeLines(lines: Line[]): { lines: Line[]; note: string } {
   if (columns) parts.push(columns === 1 ? "One page was read down each column." : `${columns} pages were read down each column.`);
   if (tables) parts.push(tables === 1 ? "One table was kept as a table." : `${tables} tables were kept as tables.`);
   if (notes) parts.push(notes === 1 ? "Notes on one page were set apart." : `Notes on ${notes} pages were set apart.`);
+  if (pictures) parts.push(pictures === 1 ? "Picture letters were left out of the prose." : `Picture letters were left out of the prose on ${pictures} pages.`);
   return { lines: out, note: parts.join(" ") };
 }
 

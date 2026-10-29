@@ -17,7 +17,7 @@ import { catalogFromOpened, recordFor, sortRecords, storeRecord } from "./librar
 const list: WordList = {
   has: (word) =>
     new Set(
-      "conscious self of the group mind sex synchronously realize realise civilisation civilization bailey often into shall other average aver age trac dour our inculcating eating cul transiting sitting tran".split(
+      "conscious self of the group mind sex synchronously realize realise civilisation civilization bailey often into shall other average aver age trac dour our inculcating eating cul transiting sitting tran gras pall mean well".split(
         " ",
       ),
     ).has(word),
@@ -92,6 +92,23 @@ describe("printed pages", () => {
     assert.equal(pages.label(1), 21);
     assert.equal(pages.label(8), 28);
   });
+
+  it("keeps the page number when it moves from the footer to the header", () => {
+    const lines: Line[] = [];
+    for (let n = 1; n <= 6; n++) {
+      lines.push(line(String(n + 10), n, 20));
+      lines.push(line("Body text of this page stays.", n, 400));
+    }
+    for (let n = 7; n <= 12; n++) {
+      lines.push(line(`${n + 12} ORIGIN OF SPECIES`, n, 760));
+      lines.push(line("Body text of this page stays and continues.", n, 400));
+    }
+    const pages = detectPrinted(lines);
+    assert.equal(pages.label(1), 11);
+    assert.equal(pages.label(6), 16);
+    assert.equal(pages.label(7), 19);
+    assert.equal(pages.label(12), 24);
+  });
 });
 
 describe("word repair", () => {
@@ -115,6 +132,12 @@ describe("word repair", () => {
     assert.equal(repairText("Ishall go", list), "I shall go");
     assert.equal(repairText("into the group", list), "into the group");
     assert.equal(repairText("synchronouslv done", list), "synchronously done");
+    assert.equal(repairText("the groupmind grew", list), "the group mind grew");
+  });
+
+  it("does not split a capitalized name into two words", () => {
+    assert.equal(repairText("Farmer Graspall met Meanwell", list), "Farmer Graspall met Meanwell");
+    assert.equal(repairText("graspall is not a name here", list), "gras pall is not a name here");
   });
 
   it("does not correct a kept name or a British spelling", () => {
@@ -218,6 +241,52 @@ describe("opened folio", () => {
     const contentsHtml = new TextDecoder().decode(archive["OEBPS/text/contents.xhtml"]);
     assert.match(contentsHtml, /The Twin Verses/);
     assert.match(contentsHtml, new RegExp(`href="${linked[1]?.id}\\.xhtml#${linked[1]?.id}"`));
+  });
+
+  it("reads a numbered contents list that uses a dot, and skips a picture credit", () => {
+    const lines: Line[] = [
+      line("i", 1, 20),
+      line("A preface sentence stays here.", 1, 400),
+      line("ii", 2, 20),
+      line("Contents", 2, 740),
+      line("Preface iii", 2, 700),
+      line("1 Comparative Timeline (B C E) xvi", 2, 680),
+      line("1 . Orientation 1", 2, 640),
+      line("david ibbetson", 2, 620),
+      line("2 . Law as Text 2", 2, 600),
+      line("12 . Conclusion 12", 2, 400),
+      line("Bibliography 13", 2, 360),
+      line("Index 14", 2, 340),
+      line("and noted calligrapher (© Pictures from History / Bridgeman Images). 6", 2, 200),
+      line("iii", 3, 20),
+      line("The preface stays.", 3, 400),
+    ];
+    for (let n = 1; n <= 14; n++) {
+      const file = 3 + n;
+      lines.push(line(String(n), file, 20));
+      lines.push(line(`The body of page ${n} stays.`, file, 400));
+    }
+    for (let n = 3; n <= 11; n++) lines.push(line(`${n} . Chapter Title ${n}`, 2, 580 - n * 12));
+    const folio = assembleFolio(lines, {
+      title: "Cambridge",
+      subtitle: "",
+      sourceName: "cambridge.pdf",
+      emptyMessage: "empty",
+      lexicon: { has: (word) => word === "bibliography" || word === "index" },
+    });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels[0], "Contents");
+    assert.ok(labels.includes("Preface"));
+    assert.ok(labels.includes("1 · Orientation"));
+    assert.ok(labels.includes("2 · Law as Text"));
+    assert.ok(labels.includes("12 · Conclusion"));
+    assert.ok(labels.includes("Bibliography"));
+    assert.ok(labels.includes("Index"));
+    assert.equal(labels.includes("david ibbetson"), false);
+    assert.equal(labels.some((label) => /calligrapher|Bridgeman/.test(label)), false);
+    const shown = folio.chapters[0].blocks.filter((block) => block.t === "toc-entry").map((block) => block.s);
+    assert.ok(shown.includes("1 · Orientation"));
+    assert.equal(shown.some((label) => label?.startsWith("1. ")), false);
   });
 
   it("keeps a hundred contents entries, including a proper name", () => {
@@ -734,6 +803,266 @@ describe("opened folio", () => {
     assert.ok(labels.indexOf("Chapter 20 - Early") < labels.indexOf("Chapter 72 - Later"));
     const last = folio.toc.find((item) => item.label === "Chapter 87 - Later");
     assert.equal(last?.children.some((child) => /Chapter 1/.test(child.label)), false);
+  });
+
+  it("does not open a chapter on a tall line of prose", () => {
+    const lines: Line[] = [];
+    for (let n = 0; n < 12; n++) {
+      lines.push(line(`The story continues with sentence number ${n} about the farmer.`, 3, 700 - n * 16, { h: 11, x0: 72, x1: 520 }));
+    }
+    lines.push(line("were born, was not that sort of a man. A rich relation came", 3, 470, { h: 16, x0: 72, x1: 520 }));
+    lines.push(line("The next sentence stays in the same stretch of the tale.", 3, 440, { h: 11, x0: 72, x1: 520 }));
+    lines.push(line("WIZARD", 4, 700, { h: 28, x0: 40, x1: 180, pageW: 600 }));
+    lines.push(line("Dorothy lived in the midst of the great Kansas prairies.", 4, 640, { h: 11, x0: 72, x1: 520 }));
+    lines.push(line("The WON-", 4, 560, { h: 28, x0: 40, x1: 200, pageW: 600 }));
+    lines.push(line("The title page keeps the broken word in the text.", 4, 500, { h: 11, x0: 72, x1: 520 }));
+    lines.push(line("Iwl^ PRANK B)il", 4, 420, { h: 28, x0: 180, x1: 420, pageW: 600 }));
+    lines.push(line("The of Father Goose", 4, 340, { h: 18, x0: 160, x1: 440, pageW: 600 }));
+    lines.push(line("The Cyclone", 5, 700, { h: 22, x0: 230, x1: 370, pageW: 600 }));
+    lines.push(line("Dorothy looked at the gray sky and held on.", 5, 640, { h: 11, x0: 72, x1: 520 }));
+    lines.push(line("Morning the", 6, 700, { h: 20, x0: 200, x1: 360, pageW: 600 }));
+    lines.push(line("Scarecrow said the day was fine.", 6, 660, { h: 11, x0: 72, x1: 520 }));
+    lines.push(line("Why do you stare", 7, 700, { h: 16, x0: 200, x1: 420, pageW: 600 }));
+    lines.push(line("At the painted joker in the corner.", 7, 670, { h: 11, x0: 72, x1: 520 }));
+    const folio = assembleFolio(lines, { title: "Story", subtitle: "", sourceName: "prose.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.some((label) => /were born|rich relation|Wizard|WON|PRANK|Father Goose|Morning|stare/.test(label)), false);
+    assert.ok(labels.some((label) => /Cyclone/.test(label)));
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).join(" ");
+    assert.match(prose, /rich relation came/);
+    assert.match(prose, /Kansas prairies/);
+    assert.match(prose, /broken word/);
+    assert.match(prose, /day was fine/);
+    assert.match(prose, /painted joker/);
+  });
+
+  it("keeps small-cap contents names and does not slice the chapter on the word I", () => {
+    const words = new Set(
+      "the story of door search for mr was quite at ease murder case incident letter remarkable last night narrative but happen have noticed his address lives some square other sir make it a rule mine you never asked body stays here full statement dr".split(
+        " ",
+      ),
+    );
+    const lines: Line[] = [line("A preface sentence stays here.", 1, 400), line("1", 1, 20), line("Contents", 2, 720), line("2", 2, 20)];
+    const titles = [
+      "STORY OF THE DOOR 3",
+      "SEARCH FOR MR. HYDE .... 4",
+      "DR. JEKYLL WAS QUITE AT EASE 5",
+      "THE CAREW MURDER CASE .... 6",
+      "REMARKABLE INCIDENT OF DR. LANYON 7",
+      "HENRY JEKYLL'S FULL STATEMENT OF THE",
+      "CASE .... 8",
+    ];
+    titles.forEach((title, index) => lines.push(line(title, 2, 680 - index * 18)));
+    for (let n = 3; n <= 8; n++) lines.push(line(String(n), n, 20));
+    lines.push(line("But I happen to have noticed his address ; he lives in some square or other.", 3, 400));
+    lines.push(line("And you never asked about the place with the door.", 3, 380));
+    lines.push(line("No, sir, I make it a rule of mine and I ask nothing.", 4, 400));
+    lines.push(line("The body of the search stays here.", 4, 360));
+    lines.push(line("The body of the last night stays here.", 8, 400));
+    const folio = assembleFolio(lines, {
+      title: "Jekyll",
+      subtitle: "",
+      sourceName: "jekyll.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      lexicon: { has: (word) => words.has(word) },
+    });
+    const labels = folio.toc.map((item) => item.label);
+    assert.ok(labels.some((label) => /STORY OF THE DOOR/.test(label)));
+    assert.ok(labels.some((label) => /SEARCH FOR MR\. HYDE/.test(label)));
+    assert.ok(labels.some((label) => /REMARKABLE INCIDENT OF DR\. LANYON/.test(label)));
+    assert.ok(labels.some((label) => /STATEMENT OF THE CASE/.test(label)));
+    assert.equal(labels.some((label) => /noticed his address|make it a rule|^But$/.test(label)), false);
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).join(" ");
+    assert.match(prose, /noticed his address/);
+    assert.match(prose, /search stays here/);
+  });
+
+  it("does not slice a play on a spoken line or a publisher list", () => {
+    const lines: Line[] = [];
+    for (let n = 1; n <= 8; n++) {
+      lines.push(line(String(n), n, 20));
+      lines.push(line(`The scene on page ${n} stays in the play.`, n, 500));
+    }
+    lines.push(line("Helmer (playing). Slower ! Slower 3", 5, 360));
+    lines.push(line("am going at once 4", 6, 340));
+    lines.push(line("For Children from 7", 7, 340));
+    lines.push(line("For Players from 8", 8, 340));
+    const folio = assembleFolio(lines, { title: "Doll", subtitle: "", sourceName: "doll.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.some((label) => /Helmer|am going|For Children|For Players/.test(label)), false);
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).join(" ");
+    assert.match(prose, /scene on page 5/);
+    assert.match(prose, /Slower/);
+  });
+
+  it("opens a play on its acts, not on the advertisements after it", () => {
+    const lines: Line[] = [];
+    for (const [act, page] of [
+      ["ACT I", 2],
+      ["ACT II", 3],
+      ["ACT III", 4],
+    ] as const) {
+      lines.push(line(act, page, 700, { h: 18, x0: 250, x1: 340, pageW: 600 }));
+      lines.push(line(`The scene of ${act} stays in the play.`, page, 640, { h: 11, x0: 72, x1: 520 }));
+      lines.push(line("Helmer speaks and the talk goes on for a while.", page, 620, { h: 11, x0: 72, x1: 520 }));
+    }
+    lines.push(line("THE NELSON PLAYBOOKS", 5, 700, { h: 22, x0: 120, x1: 480, pageW: 600 }));
+    lines.push(line("A graduated course in drama for schools and amateurs.", 5, 640, { h: 11, x0: 72, x1: 240, pageW: 600 }));
+    const folio = assembleFolio(lines, { title: "Doll", subtitle: "", sourceName: "doll.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.ok(labels.includes("Act I"));
+    assert.ok(labels.includes("Act II"));
+    assert.ok(labels.includes("Act III"));
+    assert.equal(labels.some((label) => /Nelson|Helmer/.test(label)), false);
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).join(" ");
+    assert.match(prose, /scene of ACT II/);
+  });
+
+  it("does not open a chapter on a library stamp or a publisher list", () => {
+    const lines: Line[] = [];
+    for (let n = 0; n < 14; n++) lines.push(line(`A body sentence stays on the opening page number ${n}.`, 1, 720 - n * 14, { h: 11, x0: 72, x1: 520 }));
+    lines.push(line("LIBRARY FUNDS", 2, 500, { h: 20, x0: 180, x1: 420, pageW: 600 }));
+    lines.push(line("BROTHER LAWRENCE", 3, 500, { h: 22, x0: 160, x1: 440, pageW: 600 }));
+    lines.push(line("THE COMRADE SERIES", 4, 700, { h: 24, x0: 140, x1: 460, pageW: 600 }));
+    lines.push(line("A new series of brochure gems by recognized favorites among writers.", 4, 660, { h: 11, x0: 72, x1: 220, pageW: 600 }));
+    for (let n = 0; n < 6; n++) lines.push(line(`Author . Essay Title ${n}.`, 4, 620 - n * 16, { h: 11, x0: 90, x1: 220, pageW: 600 }));
+    lines.push(line("Brother Lawrence", 5, 700, { h: 26, x0: 150, x1: 450, pageW: 600 }));
+    lines.push(line("The value of this little book is its extreme simplicity.", 5, 640, { h: 11, x0: 72, x1: 520 }));
+    lines.push(line("The trouble with most of the religion of the day is its complexity.", 5, 620, { h: 11, x0: 72, x1: 520 }));
+    const folio = assembleFolio(lines, { title: "Lawrence", subtitle: "", sourceName: "lawrence.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.some((label) => /Library Funds|Comrade Series/.test(label)), false);
+    assert.ok(labels.some((label) => /Brother Lawrence/.test(label)));
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).join(" ");
+    assert.match(prose, /extreme simplicity/);
+  });
+
+  it("reads a contents mark before the book number and keeps XI between X and XII", () => {
+    const lines: Line[] = [line("Contents", 2, 760)];
+    const books = [
+      ["I", 10],
+      ["II", 20],
+      ["III", 30],
+      ["IV", 40],
+      ["V", 50],
+      ["VI", 60],
+      ["VII", 70],
+      ["VIII", 80],
+      ["IX", 90],
+      ["X", 100],
+      ["XL", 110],
+      ["XII", 120],
+    ] as const;
+    books.forEach(([num, page], index) => {
+      const mark = num === "VI" || num === "VII" ? "^ " : "";
+      lines.push(
+        line(`${mark}BOOK ${num}. . ${page}`, 2, 740 - index * 18, {
+          cells: [
+            { text: `${mark}BOOK ${num}.`, x0: 15, x1: 120 },
+            { text: String(page), x0: 180, x1: 220 },
+          ],
+        }),
+      );
+      lines.push(line(String(page), page, 30));
+      lines.push(line(`BOOK ${num}.`, page, 700, { h: 18 }));
+      lines.push(line(`The text of book ${num} stays here.`, page, 640));
+    });
+    const folio = assembleFolio(lines, { title: "Marcus", subtitle: "", sourceName: "books.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.ok(labels.some((label) => /\bVI\b/.test(label)));
+    assert.ok(labels.some((label) => /\bVII\b/.test(label)));
+    assert.equal(labels.some((label) => /^\^/.test(label)), false);
+    assert.ok(labels.some((label) => /\bXI\b/.test(label)));
+    assert.equal(labels.some((label) => /\bXL\b/.test(label)), false);
+    const xi = labels.findIndex((label) => /\bXI\b/.test(label));
+    const x = labels.findIndex((label) => /\bX\b/.test(label) && !/\bXI\b|XII/.test(label));
+    const xii = labels.findIndex((label) => /\bXII\b/.test(label));
+    assert.ok(x >= 0 && xi > x && xii > xi);
+    const sixth = folio.chapters.find((chapter) => /\bVI\b/.test(chapter.title));
+    const body = (sixth?.blocks || []).flatMap((block) => block.runs || []).join(" ");
+    assert.match(body, /book VI stays/);
+  });
+
+  it("keeps a sentence in the bottom band of a short page", () => {
+    const lines: Line[] = [
+      line("Farmer Meanwell left the village with his family.", 2, 200, { pageH: 452 }),
+      line("and Graspall she was not free from trouble and care.", 2, 28, { pageH: 452 }),
+      line("He soon fell ill, and when he found himself unable to get work.", 2, 15, { pageH: 452 }),
+      line("12", 2, 12, { pageH: 452 }),
+    ];
+    const folio = assembleFolio(lines, { title: "Goody", subtitle: "", sourceName: "short.pdf", emptyMessage: "empty", skipEpub: true });
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).join(" ");
+    assert.match(prose, /trouble and care/);
+    assert.match(prose, /fell ill/);
+    assert.doesNotMatch(prose, /\b12\b/);
+  });
+
+  it("keeps a picture's letters out of the sentence beside them", () => {
+    const g = globalThis as { URL?: { createObjectURL?: (b: Blob) => string } };
+    g.URL = g.URL || {};
+    g.URL.createObjectURL = () => "blob:folio-test";
+    const lines: Line[] = [];
+    for (let n = 0; n < 4; n++) {
+      lines.push(line(`The crow spoke a full sentence number ${n} about the field.`, 3, 640 - n * 16, { x0: 95, x1: 350, h: 12 }));
+    }
+    lines.push(line("3J^]^^t,^", 3, 560, { x0: 174, x1: 250, h: 11 }));
+    lines.push(
+      line("such a good arL but\\tne al", 3, 500, {
+        x0: 95,
+        x1: 349,
+        h: 12,
+        cells: [
+          { text: "such a good", x0: 95, x1: 163 },
+          { text: "arL but\\tne al", x0: 267, x1: 349 },
+        ],
+      }),
+    );
+    lines.push(line("Scarecro.v^fter", 3, 488, { x0: 168, x1: 260, h: 11 }));
+    lines.push(line("all the corn he wanted from the field.", 3, 470, { x0: 95, x1: 350, h: 12 }));
+    for (let n = 0; n < 4; n++) {
+      lines.push(line(`A quiet sentence on the dinner page number ${n} stays put.`, 4, 640 - n * 16, { x0: 40, x1: 340, h: 12 }));
+    }
+    lines.push(
+      line("fruit from a tree near for her dinner.", 4, 400, {
+        x0: 40,
+        x1: 349,
+        h: 12,
+        cells: [
+          { text: "fruit from a tree near", x0: 40, x1: 161 },
+          { text: "for her dinner.", x0: 268, x1: 349 },
+        ],
+      }),
+    );
+    lines.push(line("bA\\;^ttiiill(i//i^", 4, 388, { x0: 165, x1: 243, h: 11 }));
+    lines.push(line("Dorothy ate it before the sun went down.", 4, 360, { x0: 40, x1: 340, h: 12 }));
+    const folio = assembleFolio(lines, { title: "Oz", subtitle: "", sourceName: "picture.pdf", emptyMessage: "empty", skipEpub: true });
+    const prose = folio.chapters
+      .flatMap((chapter) => chapter.blocks)
+      .flatMap((block) => block.runs || [])
+      .filter((run) => typeof run === "string")
+      .join(" ");
+    assert.match(prose, /such a good Scarecro/);
+    assert.match(prose, /fruit from a tree near for her dinner/);
+    assert.doesNotMatch(prose, /arL|ttiiill|3J\^/);
+    const good = prose.indexOf("such a good");
+    const next = prose.indexOf("all the corn");
+    assert.ok(good >= 0 && next > good);
+  });
+
+  it("does not slice the book from a contents list that has no page numbers", () => {
+    const lines: Line[] = [line("List of Chapters", 2, 760, { h: 16 })];
+    for (let n = 1; n <= 8; n++) lines.push(line(`Chapter ${n}. A title with no page`, 2, 720 - n * 20));
+    for (let page = 4; page <= 20; page++) {
+      lines.push(line(`The tale keeps its order on file page ${page}.`, page, 500, { h: 11, x0: 72, x1: 520 }));
+    }
+    const folio = assembleFolio(lines, { title: "Oz", subtitle: "", sourceName: "nopages.pdf", emptyMessage: "empty", skipEpub: true });
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).filter((run) => typeof run === "string").join(" ");
+    assert.match(prose, /file page 4/);
+    assert.match(prose, /file page 20/);
+    const at4 = prose.indexOf("file page 4");
+    const at20 = prose.indexOf("file page 20");
+    assert.ok(at4 >= 0 && at20 > at4);
   });
 });
 
