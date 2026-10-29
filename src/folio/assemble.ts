@@ -357,7 +357,7 @@ function contentsPair(cells: string[] | undefined): { title: string; token: stri
   if (!cells) return null;
   const usable = cells.length === 4 && cells[0] === cells[2] && cells[1] === cells[3] ? cells.slice(0, 2) : cells;
   if (usable.length !== 2 || !PAGE_TOKEN.test(usable[1]) || !/[A-Za-z]/.test(usable[0]) || usable[0].length > 90) return null;
-  const title = usable[0].replace(/^[^A-Za-z0-9]+/, "").replace(/[.\s]+$/g, "").trim();
+  const title = tidyContentsTitle(usable[0].replace(/^[^A-Za-z0-9]+/, ""));
   if (title.length < 2 || /[.?!]$/.test(title)) return null;
   return { title, token: usable[1], trusted: /^(?:book|chapter|part)\b/i.test(title) };
 }
@@ -492,7 +492,8 @@ function contentsSentence(text: string) {
   if (!title) return false;
   if (/^[a-z]/.test(title)) return true;
   if (/[;!?]/.test(title) || /[(){}[\]]/.test(title) || /,/.test(title)) return true;
-  if (/[A-Za-z]{4,}\.\s+\S/.test(title)) return true;
+  const sentencePeriod = /([A-Za-z]{4,})\.\s+\S/.exec(title);
+  if (sentencePeriod && !romanChapter(sentencePeriod[1])) return true;
   const small = new Set(["a", "an", "the", "and", "or", "but", "nor", "of", "in", "on", "at", "to", "for", "by", "as", "from", "with", "into", "over", "upon", "if", "so", "not", "no", "yes"]);
   const cores = title.split(/\s+/).map((word) => word.replace(/[^A-Za-z'’]/g, "")).filter((word) => word.length >= 2);
   if (cores.length > 0 && cores.every((word) => small.has(word.toLowerCase()))) return true;
@@ -677,10 +678,14 @@ function contentsOutline(lines: Line[], printed: PrintedPages, lexicon: WordList
       return;
     }
     for (const entry of found) {
-      entry.title = entry.title.replace(/^[^A-Za-z0-9]+/, "").replace(/\s+/g, " ").trim();
+      entry.title = tidyContentsTitle(entry.title.replace(/^[^A-Za-z0-9]+/, ""));
       if (entry.title.length < 2 || /©|®/.test(entry.title)) continue;
       if (contentsSentence(entry.title) && !/^(?:book|chapter|part)\b/i.test(entry.title)) continue;
       if (!entry.trusted && /^(?:book|chapter|part)\b/i.test(entry.title)) entry.trusted = true;
+      if (!entry.trusted) {
+        const romanHead = /^([ivxlcdm]{1,8})[.)]\s+\S/i.exec(entry.title);
+        if (romanHead && romanChapter(romanHead[1])) entry.trusted = true;
+      }
       if (!entry.trusted && capsTitle(entry.title)) entry.trusted = true;
       if (lexicon && !entry.trusted && !knownTitle(entry.title, lexicon)) continue;
       const page = fileForLabel(printed, entry.token, maxPage);

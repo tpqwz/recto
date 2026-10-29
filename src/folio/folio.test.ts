@@ -878,6 +878,41 @@ describe("opened folio", () => {
     assert.match(prose, /search stays here/);
   });
 
+  it("keeps a roman contents line with a comma or a long numeral", () => {
+    const words = new Set("the machine is lost strange animal inventor sunset night came".split(" "));
+    const lines: Line[] = [line("Contents", 2, 740), line("2", 2, 20)];
+    const rows: [string, number, { text: string; x0: number; x1: number }[]?][] = [
+      ["I. The Inventor, . . . 3", 680],
+      ["V. Sunset, . . 4", 660],
+      ["VI. The Machine is Lost, . 5", 640, [
+        { text: "VI. The Machine is Lost, .", x0: 40, x1: 220 },
+        { text: "5", x0: 250, x1: 280 },
+      ]],
+      ["VII. The Strange Animal, . 6", 620],
+      ["VIII. The Morlocks, . . 7", 600],
+      ["XIII. The Further Vision, . 8", 580],
+    ];
+    for (const [text, y, cells] of rows) lines.push(line(text, 2, y, cells ? { cells } : {}));
+    for (let n = 3; n <= 8; n++) {
+      lines.push(line(String(n), n, 20));
+      lines.push(line(`The body of chapter ${n} stays here.`, n, 400));
+    }
+    lines.push(line("Nora. He went home and stayed there.", 4, 360));
+    const folio = assembleFolio(lines, {
+      title: "Time",
+      subtitle: "",
+      sourceName: "time.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      lexicon: { has: (word) => words.has(word) },
+    });
+    const labels = folio.toc.map((item) => item.label);
+    assert.ok(labels.some((label) => /VI\b/.test(label) && /Machine is Lost/.test(label)));
+    assert.ok(labels.some((label) => /VIII\b/.test(label) && /Morlocks/.test(label)));
+    assert.ok(labels.some((label) => /XIII\b/.test(label) && /Further Vision/.test(label)));
+    assert.equal(labels.some((label) => /Nora/.test(label)), false);
+  });
+
   it("does not slice a play on a spoken line or a publisher list", () => {
     const lines: Line[] = [];
     for (let n = 1; n <= 8; n++) {
