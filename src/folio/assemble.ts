@@ -961,7 +961,33 @@ function contentsOutline(lines: Line[], printed: PrintedPages, lexicon: WordList
     ...(item.printed != null ? { printed: item.printed } : {}),
   }));
   if (catalogContents(items, ordered)) return { items: [] as OutlineItem[], drop: new Set<Line>() };
+  snapToHeading(items, ordered);
   return { items, drop };
+}
+
+/** A contents page that never opens its chapter. The heading further on is the start. */
+function snapToHeading(items: OutlineItem[], lines: Line[]) {
+  const pages = items.map((item) => item.page || 0).filter((page) => page > 0).sort((a, b) => a - b);
+  const mark = (text: string, index: number) => {
+    if (chapterIndex(text) !== index) return false;
+    const title = text.replace(/\s+/g, " ").trim();
+    if (title.length > 80) return false;
+    return chapterMarkLine(title) || chapterLabel(title) || chapterish(title);
+  };
+  for (const item of items) {
+    const index = chapterIndex(item.label);
+    const page = item.page || 0;
+    if (!index || !page || titleOpens(item.label, page, lines)) continue;
+    if (lines.some((line) => line.page >= page - 1 && line.page <= page + 2 && mark(line.text, index))) continue;
+    const next = pages.find((start) => start > page + 2) ?? page + 48;
+    let found = 0;
+    for (const line of lines) {
+      if (line.page <= page + 2 || line.page >= next) continue;
+      if (!mark(line.text, index)) continue;
+      if (!found || line.page < found) found = line.page;
+    }
+    if (found) item.page = found;
+  }
 }
 
 function oneWordTitle(label: string) {

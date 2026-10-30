@@ -1735,6 +1735,44 @@ describe("interlinear pages", () => {
     assert.match(stave, /phantom stays/);
   });
 
+  it("starts a chapter at its heading when the contents page is still the previous chapter", () => {
+    const lines: Line[] = [
+      line("Contents", 1, 720),
+      line("V. Advice from a Caterpillar .......... 3", 1, 680),
+      line("VI. Pig and Pepper .......... 4", 1, 658),
+      line("VII. A Mad Tea-Party .......... 9", 1, 636),
+    ];
+    for (const page of [3, 4, 5, 6, 7, 8, 9]) lines.push(line(String(page), page, 20));
+    lines.push(
+      line("CHAPTER V.", 3, 700, { h: 16 }),
+      line("The caterpillar stays in this chapter.", 3, 640),
+      line("That is not said right, said the Caterpillar.", 4, 640),
+      line("The advice goes on for another page.", 5, 640),
+      line("CHAPTER VI.", 8, 700, { h: 16 }),
+      line("PIG AND PEPPER.", 8, 660),
+      line("The pepper starts here.", 8, 600),
+      line("CHAPTER VII.", 9, 700, { h: 16 }),
+      line("The tea starts here.", 9, 640),
+    );
+    const folio = assembleFolio(lines, {
+      title: "Alice",
+      subtitle: "",
+      sourceName: "early.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      lexicon: { has: (word) => word.length >= 2 },
+    });
+    const pepper = folio.chapters.find((chapter) => /pepper/i.test(chapter.title));
+    const caterpillar = folio.chapters.find((chapter) => /caterpillar/i.test(chapter.title));
+    assert.equal(pepper?.blocks[0]?.src, 8);
+    const pepperText = (pepper?.blocks || []).flatMap((block) => block.runs || []).join(" ");
+    const earlier = (caterpillar?.blocks || []).flatMap((block) => block.runs || []).join(" ");
+    assert.match(pepperText, /pepper starts/);
+    assert.equal(pepperText.includes("not said right"), false);
+    assert.match(earlier, /not said right/);
+    assert.match(earlier, /caterpillar stays/);
+  });
+
   it("drops a running head whose wording changes and keeps one sentence", () => {
     const lines: Line[] = [];
     for (const page of [1, 2, 3]) {
