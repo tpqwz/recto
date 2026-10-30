@@ -64,6 +64,19 @@ function known(word: string, list: WordList) {
   return STOP.has(word) || list.has(word);
 }
 
+/** Enough of the line is English that an English word list may repair it. A line of Latin is not. */
+export function readsEnglish(text: string, list: WordList) {
+  const tokens = text.match(/\b[A-Za-z]{3,}\b/g) || [];
+  if (tokens.length < 5) {
+    const long = tokens.filter((token) => token.length >= 6);
+    if (long.length < 2) return true;
+    return long.some((token) => known(token.toLowerCase(), list));
+  }
+  let knownWords = 0;
+  for (const token of tokens) if (known(token.toLowerCase(), list)) knownWords++;
+  return knownWords / tokens.length >= 0.4;
+}
+
 export function mergeHyphen(prev: string, next: string, list: WordList, hyphens: { n: number }) {
   const match = next.match(/^([A-Za-z]+)([\s\S]*)$/);
   const lastMatch = prev.match(/([A-Za-z]+)-$/);
@@ -81,8 +94,7 @@ export function mergeHyphen(prev: string, next: string, list: WordList, hyphens:
   if (known(last.toLowerCase(), list) && known(suf.toLowerCase(), list) && last.length >= 3 && suf.length >= 4) {
     return { head: head + last + "-" + suf, rest };
   }
-  hyphens.n++;
-  return { head: head + last + suf, rest };
+  return null;
 }
 
 function forceGlue(token: string, list: WordList) {
@@ -194,6 +206,53 @@ function undoubled(token: string, list: WordList) {
   if (token === lower) return fixed;
   if (token[0] === token[0].toUpperCase() && token.slice(1) === lower.slice(1)) return fixed[0].toUpperCase() + fixed.slice(1);
   return null;
+}
+
+function isRomanNumeral(token: string) {
+  return /^(?=[ivxlcdm]+$)m{0,4}(cm|cd|d?c{0,3})(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})$/i.test(token);
+}
+
+/** Heading OCR, not a Latin line. Unknown tokens only, and a known word is left alone. */
+const HEADING_ALT: Record<string, string> = { ...CONFUSABLE, e: "cr", k: "r", x: "n" };
+
+function headingEdit(token: string, list: WordList) {
+  const lower = token.toLowerCase();
+  if (lower.length < 3 || lower.length > 24 || !/^[a-z]+$/.test(lower)) return null;
+  if (isRomanNumeral(lower) || known(lower, list) || NEVER.has(lower)) return null;
+  const hits = new Set<string>();
+  for (let i = 0; i < lower.length; i++) {
+    for (const alt of HEADING_ALT[lower[i]] || "") {
+      const cand = lower.slice(0, i) + alt + lower.slice(i + 1);
+      if (cand !== lower && known(cand, list)) hits.add(cand);
+    }
+  }
+  if (hits.size !== 1) return null;
+  const fixed = [...hits][0];
+  if (token === token.toLowerCase()) return fixed;
+  if (token === token.toUpperCase()) return fixed.toUpperCase();
+  if (token[0] === token[0].toUpperCase() && token.slice(1) === lower.slice(1)) return fixed[0].toUpperCase() + fixed.slice(1);
+  return fixed;
+}
+
+export function repairHeading(text: string, list: WordList) {
+  return text.replace(/[A-Za-z]+/g, (token) => headingEdit(token, list) || token);
+}
+
+/** One OCR step from a contents word toward the word printed in the chapter. Not the reverse. */
+const STEP_ALT: Record<string, string> = { k: "r", r: "p", x: "n", e: "r", v: "y" };
+
+export function headingStep(from: string, to: string) {
+  const a = from.toLowerCase().replace(/[^a-z]/g, "");
+  const b = to.toLowerCase().replace(/[^a-z]/g, "");
+  if (!a || a.length !== b.length || a === b) return false;
+  let diffs = 0;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === b[i]) continue;
+    diffs += 1;
+    if (diffs > 1) return false;
+    if (!(STEP_ALT[a[i]] || "").includes(b[i])) return false;
+  }
+  return diffs === 1;
 }
 
 function oneEdit(token: string, list: WordList) {

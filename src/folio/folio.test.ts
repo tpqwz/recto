@@ -1,15 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { detectPrinted } from "./pages.ts";
-import { mergeHyphen, repairText, type WordList } from "./repair.ts";
-import { assembleFolio, epubArchive, type Line } from "./assemble.ts";
+import { headingStep, mergeHyphen, repairHeading, repairText, type WordList } from "./repair.ts";
+import { assembleFolio, cluster, contentsEntry, epubArchive, type Line } from "./assemble.ts";
 import { strToU8, unzipSync, zipSync } from "fflate";
 import { linesFromBoxes, linesFromRegion, pictureScale } from "./picture.ts";
 import { parseSettings } from "./settings.ts";
 import { explainSaveFailure, formatBytes, OTHER_READER_BYTES, PICTURE_READER_BYTES, type StorageReport } from "./storage.ts";
-import { looksScrappy, needsPicture, scriptIn } from "./script.ts";
+import { looksMangled, looksScrappy, needsPicture, pageNeedsPicture, scriptIn } from "./script.ts";
 import { checkSameText, folioText, textFromReference } from "./check.ts";
-import { mergeScriptLines, readablePicture, untwinLine } from "./cases.ts";
+import { keepPageLanguage, mergeScriptLines, pageLooksMixed, readablePicture, untwinLine } from "./cases.ts";
 import { dismissEntry, hideSample, listHoldings, listShelf, rememberOpened, splitStored, withoutOpened, SHELF_LIMIT, SAMPLES, type ShelfState } from "./shelf.ts";
 import { bookKey } from "./revise.ts";
 import { catalogFromOpened, recordFor, sortRecords, storeRecord } from "./library.ts";
@@ -120,6 +120,31 @@ describe("word repair", () => {
     const kept = mergeHyphen("the self-", "conscious mind", list, hyphens);
     assert.equal(kept?.head, "the self-conscious");
     assert.equal(hyphens.n, 1);
+    assert.equal(mergeHyphen("super-", "eminet tecto", list, hyphens), null);
+    assert.equal(hyphens.n, 1);
+  });
+
+  it("repairs an English line and leaves a Latin line", () => {
+    const lexicon = {
+      has: (word: string) => word === "nature" || "kindly temper follows home today".split(" ").includes(word) || list.has(word),
+    };
+    const folio = assembleFolio(
+      [
+        line("atque hinc illa fert natvre pharetram humero gradiens super-", 2, 640),
+        line("eminet tecto sub radiis caput altis longe.", 2, 620),
+        line("From the natvre of the mind a kindly temper follows him home.", 3, 640),
+        line("From the riv-", 4, 640),
+        line("erside a kindly temper follows him home today.", 4, 620),
+      ],
+      { title: "Two tongues", subtitle: "", sourceName: "t.pdf", emptyMessage: "empty", lexicon, skipEpub: true },
+    );
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).filter((run) => typeof run === "string").join("\n");
+    assert.match(prose, /fert natvre pharetram/);
+    assert.equal(prose.includes("supereminet"), false);
+    assert.match(prose, /super-/);
+    assert.match(prose, /nature of the mind/);
+    assert.equal(prose.includes("natvre of the mind"), false);
+    assert.match(prose, /riverside/);
   });
 
   it("splits glued tokens and fixes one OCR edit", () => {
@@ -144,6 +169,22 @@ describe("word repair", () => {
     assert.equal(repairText("Wesak and antahkarana", list), "Wesak and antahkarana");
     assert.equal(repairText("realise civilisation", list), "realise civilisation");
     assert.equal(repairText("colourise the group", list), "colourise the group");
+  });
+
+  it("repairs a heading and will not step a good word backwards", () => {
+    const heads: WordList = {
+      has: (word) => "tears sends and party pool tale".split(" ").includes(word) || list.has(word),
+    };
+    assert.equal(repairHeading("THE POOL OF TEAES", heads), "THE POOL OF TEARS");
+    assert.equal(repairHeading("THE RABBIT SEXDS IN A LITTLE BILL", heads), "THE RABBIT SEXDS IN A LITTLE BILL".replace("SEXDS", "SENDS"));
+    assert.equal(repairHeading("A MAD TEA-PARTV", heads), "A MAD TEA-PARTY");
+    assert.equal(repairHeading("A CAUCUS-RACE AXD A LONG TALE", heads), "A CAUCUS-RACE AND A LONG TALE");
+    assert.equal(repairHeading("THE POOL OF TEAKS", { has: (word) => word === "teaks" || heads.has(word) }), "THE POOL OF TEAKS");
+    assert.equal(headingStep("teaks", "tears"), true);
+    assert.equal(headingStep("tears", "teaks"), false);
+    assert.equal(headingStep("rig", "pig"), true);
+    assert.equal(headingStep("mad", "mau"), false);
+    assert.equal(headingStep("croquet", "choquet"), false);
   });
 });
 
@@ -1143,6 +1184,87 @@ describe("picture pages", () => {
     assert.equal(lines[0].page, 2);
     assert.ok(lines[0].y > 150);
   });
+
+  it("keeps a Greek page and the English page that faces it", () => {
+    const lexicon = { has: (word: string) => word === "nature" || list.has(word) };
+    const greek = [
+      line("ἐκ τῆς natvre τοῦ νοῦ πρᾶον ἦθος ἕπεται.", 4, 640, { h: 11 }),
+      line("^1 καὶ αἰδὼς καὶ ἀνδρεία.", 4, 620, { h: 11 }),
+    ];
+    const english = [
+      line("From the natvre of the mind a kindly temper follows him home.", 5, 640),
+      line("Modesty and manliness follow with it.", 5, 620),
+    ];
+    const folio = assembleFolio([...greek, ...english], {
+      title: "Meditations",
+      subtitle: "",
+      sourceName: "m.pdf",
+      emptyMessage: "empty",
+      lexicon,
+      skipEpub: true,
+    });
+    const texts = folio.chapters.flatMap((chapter) => chapter.blocks).map((block) => (block.runs || []).filter((run) => typeof run === "string").join(" "));
+    const greekBlock = texts.find((text) => text.includes("νοῦ"));
+    if (!greekBlock) throw new Error("missing Greek block");
+    assert.match(greekBlock, /natvre/);
+    assert.equal(greekBlock.includes("kindly"), false);
+    const prose = texts.join("\n");
+    assert.ok(prose.indexOf("νοῦ") < prose.indexOf("kindly temper"));
+    assert.match(prose, /nature of the mind/);
+    assert.equal(prose.includes("natvre of the mind"), false);
+  });
+
+  it("keeps both languages when one page prints both", () => {
+    const lines = [
+      line("ἐκ τῆς φύσεως τοῦ νοῦ πρᾶον ἦθος ἕπεται αὐτῷ.", 4, 640, { h: 11 }),
+      line("καὶ αἰδὼς καὶ ἀνδρεία συνέπεται.", 4, 622, { h: 11 }),
+      line("From the nature of the mind a kindly temper follows him.", 4, 560),
+      line("Modesty and manliness follow with it.", 4, 542),
+    ];
+    const folio = assembleFolio(lines, { title: "Meditations", subtitle: "", sourceName: "m.pdf", emptyMessage: "empty", skipEpub: true });
+    const texts = folio.chapters.flatMap((chapter) => chapter.blocks).map((block) => (block.runs || []).filter((run) => typeof run === "string").join(" "));
+    const greekBlock = texts.find((text) => text.includes("φύσεως"));
+    const englishBlock = texts.find((text) => text.includes("kindly temper"));
+    assert.ok(greekBlock && !greekBlock.includes("kindly"));
+    assert.ok(englishBlock && !englishBlock.includes("φύσεως"));
+    const prose = texts.join("\n");
+    assert.ok(prose.indexOf("φύσεως") < prose.indexOf("kindly temper"));
+  });
+
+  it("keeps a second passage on the page and does not lay it over the English", () => {
+    const english = Array.from({ length: 8 }, (_, index) => line(`From my grandfather Verus I learned a line of good temper ${index}.`, 3, 640 - index * 16));
+    const greek = Array.from({ length: 4 }, (_, index) => line("ἐκ τῆς φύσεως τοῦ νοῦ πρᾶον ἦθος", 3, 400 - index * 16, { h: 11 }));
+    const both = keepPageLanguage(english, greek, "greek");
+    assert.equal(both.script, "greek");
+    assert.ok(both.lines.some((item) => item.text.includes("grandfather")));
+    assert.ok(both.lines.some((item) => item.text.includes("φύσεως")));
+    assert.ok(both.lines.findIndex((item) => item.text.includes("grandfather")) < both.lines.findIndex((item) => item.text.includes("φύσεως")));
+    const overlaid = keepPageLanguage(english, greek.map((item, index) => ({ ...item, y: english[index].y, x0: english[index].x0, x1: english[index].x1 })), "greek");
+    assert.equal(overlaid.script, "en");
+    assert.deepEqual(overlaid.lines.map((item) => item.text), english.map((item) => item.text));
+    assert.equal(keepPageLanguage(english, [greek[0]], "greek").script, "en");
+    const scraps = Array.from({ length: 6 }, (_, index) => line("x7 ## q", 3, 640 - index * 16));
+    const won = keepPageLanguage(scraps, greek, "greek");
+    assert.equal(won.script, "greek");
+    assert.equal(won.lines.some((item) => item.text.includes("x7")), false);
+    assert.equal(pageLooksMixed([...english.slice(0, 4), ...Array.from({ length: 4 }, () => line("x7 ## qq qq", 3, 300))]), true);
+    assert.equal(pageLooksMixed(english), false);
+    assert.equal(pageLooksMixed([...english, line("x7 ## qq qq", 3, 200), line("x7 ## qq qq", 3, 180)]), false);
+  });
+
+  it("sends a broken fount to the picture reader only when another script is on", () => {
+    const mangled = Array.from({ length: 22 }, () => "ZKovtdpios avToupytKoy").join(" ");
+    const latin = Array.from({ length: 8 }, () => "Officium est consistere in officio virtutis.").join(" ");
+    const english = Array.from({ length: 8 }, () => "From my grandfather Verus I learned good temper.").join(" ");
+    assert.equal(looksMangled(mangled), true);
+    assert.equal(looksMangled(latin), false);
+    assert.equal(looksMangled(english), false);
+    assert.equal(pageNeedsPicture(mangled, ["en"]), false);
+    assert.equal(pageNeedsPicture(mangled, ["en", "greek"]), true);
+    assert.equal(pageNeedsPicture(english, ["en", "greek"]), false);
+    const shy = `${Array.from({ length: 17 }, () => "ZKovtdpios").join(" ")} ${Array.from({ length: 30 }, () => "word").join(" ")}`;
+    assert.equal(looksMangled(shy), false);
+  });
 });
 
 describe("desk settings", () => {
@@ -1296,6 +1418,460 @@ describe("shelf", () => {
       "asc",
     );
     assert.equal(ordered[0]?.record.volume, "Volume I");
+  });
+});
+
+describe("interlinear pages", () => {
+  it("keeps an interlinear gloss under its own line", () => {
+    const pairs = [
+      ["atque hinc illa fert pharetram humeroque graditur super-", "and hence that she carries a quiver on the shoulder and"],
+      ["eminent tecto et radiis caput emicat altis", "she stands out from the roof and her head flashes with high rays"],
+      ["talis erat Dido laeta ferebat se talem per medios", "such was Dido joyful she carried herself such through the midst"],
+      ["instans operi que futuris regnis tum resedit", "intent upon the work and her future dominions then she sat"],
+      ["foribus divae media testudine templi septa", "at the gates of the goddess in the middle of the temple"],
+      ["armis que subnixa alte solio dabat jura leges", "with arms and raised high on a throne she gave laws"],
+    ];
+    const lines: Line[] = [];
+    let y = 700;
+    for (const [latin, english] of pairs) {
+      lines.push(line(latin, 40, y, { h: 9, x0: 32, x1: 250, pageW: 285, pageH: 800 }));
+      y -= 6;
+      lines.push(line(english, 40, y, { h: 7, x0: 36, x1: 240, pageW: 285, pageH: 800 }));
+      y -= 14;
+    }
+    const folio = assembleFolio(lines, { title: "Virgil", subtitle: "", sourceName: "v.pdf", emptyMessage: "empty", skipEpub: true });
+    const texts = folio.chapters.flatMap((chapter) => chapter.blocks).map((block) => (block.runs || []).filter((run) => typeof run === "string").join(" "));
+    const prose = texts.join("\n");
+    for (const text of texts) {
+      const hasLatin = /pharetram|eminent|Dido laeta|futuris|testudine|subnixa/.test(text);
+      const hasEnglish = /quiver|flashes|joyful|dominions|goddess|throne/.test(text);
+      assert.equal(hasLatin && hasEnglish, false, text);
+    }
+    assert.ok(prose.indexOf("pharetram") < prose.indexOf("quiver"));
+    assert.ok(prose.indexOf("quiver") < prose.indexOf("eminent"));
+    assert.doesNotMatch(prose, /super-and|superand/);
+  });
+
+  it("drops a running head that repeats and keeps a sentence that appears once", () => {
+    const lines: Line[] = [];
+    for (const page of [1, 2, 3]) {
+      lines.push(line("ODES OF HORACE.", page, 770, { pageH: 800 }));
+      lines.push(line("The body of the ode begins here and continues across the page.", page, 640, { pageH: 800 }));
+    }
+    lines.push(line("make him an help meet for him.", 2, 750, { pageH: 800 }));
+    lines.push(line("THE ARGUMENT", 4, 760, { pageH: 800 }));
+    lines.push(line("And the Lord God said it is not good that the man should be alone.", 4, 640, { pageH: 800 }));
+    lines.push(line("The short page still keeps this closing sentence intact.", 5, 28, { pageH: 452 }));
+    lines.push(line("12", 5, 15, { pageH: 452 }));
+    const folio = assembleFolio(lines, { title: "Bible", subtitle: "", sourceName: "b.pdf", emptyMessage: "empty", skipEpub: true });
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).filter((run) => typeof run === "string").join(" ");
+    assert.equal(prose.includes("ODES OF HORACE"), false);
+    assert.match(prose, /make him an help meet for him/);
+    assert.match(prose, /THE ARGUMENT/);
+    assert.match(prose, /body of the ode/);
+    assert.match(prose, /closing sentence intact/);
+    assert.equal(/\b12\b/.test(prose), false);
+  });
+
+  it("keeps a body chapter when the contents line has no page", () => {
+    const lines: Line[] = [line("Contents", 2, 700)];
+    const contents = [
+      "I. Down the Hole .......... 3",
+      "II. The Pool .......... 4",
+      "IV. The Rabbit .......... 5",
+      "X. The Lobster Quadrille IV,",
+      "XI. Who Stole the Tarts? 7",
+      "XII. Alice's Evidence .......... 8",
+    ];
+    contents.forEach((text, index) => lines.push(line(text, 2, 660 - index * 18)));
+    const bodies: [number, string, string][] = [
+      [3, "CHAPTER I.", "The hole stays."],
+      [4, "CHAPTER II.", "The pool stays."],
+      [5, "CHAPTER IV.", "The rabbit stays."],
+      [6, "CHAPTEK X.", "The lobster quadrille stays in its own chapter."],
+      [7, "The tarts stay in their own chapter.", ""],
+      [8, "CHAPTER XII.", "The evidence stays."],
+    ];
+    for (const [page, head, body] of bodies) {
+      lines.push(line(String(page), page, 20));
+      lines.push(line(head, page, 500, { h: 16 }));
+      if (page === 6) lines.push(line("THE LOBSTER QUADRILLE.", page, 470, { h: 14 }));
+      if (body) lines.push(line(body, page, 440));
+    }
+    const folio = assembleFolio(lines, { title: "Alice", subtitle: "", sourceName: "a.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.some((label) => /^chapter x\b/i.test(label)), true);
+    assert.equal(labels.some((label) => /who stole the tarts/i.test(label)), true);
+    const lobster = folio.chapters.find((chapter) => /^chapter x\b/i.test(chapter.title));
+    const tarts = folio.chapters.find((chapter) => /tarts/i.test(chapter.title));
+    assert.ok(lobster);
+    assert.ok(tarts);
+    const lobsterText = (lobster?.blocks || []).flatMap((block) => block.runs || []).join(" ");
+    const tartsText = (tarts?.blocks || []).flatMap((block) => block.runs || []).join(" ");
+    assert.match(lobsterText, /lobster quadrille stays/);
+    assert.match(tartsText, /tarts stay/);
+    assert.equal(lobsterText.includes("tarts stay"), false);
+  });
+
+  it("keeps a short line that sits under only part of the line above", () => {
+    const lines: Line[] = [];
+    let y = 700;
+    for (let n = 0; n < 4; n++) {
+      lines.push(line("The full line of the verse runs across the measure of the page.", 4, y, { h: 10, x0: 40, x1: 500 }));
+      y -= 12;
+      lines.push(line("Ger. sg. only", 4, y, { h: 7, x0: 48, x1: 160 }));
+      y -= 16;
+    }
+    const folio = assembleFolio(lines, { title: "Crib", subtitle: "", sourceName: "c.pdf", emptyMessage: "empty", skipEpub: true });
+    const texts = folio.chapters.flatMap((chapter) => chapter.blocks).map((block) => (block.runs || []).filter((run) => typeof run === "string").join(" "));
+    assert.equal(texts.some((text) => text.includes("Ger. sg. only") && text.includes("full line")), false);
+  });
+
+  it("reads a Hebrew line from the right", () => {
+    const words = [
+      ["לְבַדּוֹ", 40],
+      ["הָאָדָם", 110],
+      ["וַיֹּאמֶר", 190],
+      ["Genesis", 280],
+    ] as const;
+    const items = words.map(([str, x]) => ({ str, transform: [11, 0, 0, 11, x, 500], width: 60, height: 11 }));
+    const lines = cluster(items);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].text, "וַיֹּאמֶר הָאָדָם לְבַדּוֹ Genesis");
+    const greek = cluster([{ str: "καὶ εἶπεν ὁ θεὸς", transform: [12, 0, 0, 12, 40, 400], width: 120, height: 12 }]);
+    assert.equal(greek.length, 1);
+    assert.match(greek[0].text, /εἶπεν/);
+    const english = cluster([
+      { str: "From", transform: [12, 0, 0, 12, 40, 300], width: 28, height: 12 },
+      { str: "the", transform: [12, 0, 0, 12, 72, 300], width: 20, height: 12 },
+      { str: "mind", transform: [12, 0, 0, 12, 96, 300], width: 28, height: 12 },
+    ]);
+    assert.equal(english[0].text, "From the mind");
+    const split = cluster([
+      { str: "לְב ַּד", transform: [20, 0, 0, 20, 70.5, 500], width: 46.6, height: 20, dir: "rtl" },
+      { str: "וֹ", transform: [20, 0, 0, 20, 70.6, 500], width: 0, height: 20, dir: "rtl" },
+      { str: "הָאָדָם", transform: [20, 0, 0, 20, 124, 500], width: 52, height: 20, dir: "rtl" },
+      { str: "וַיֹּאמֶר", transform: [20, 0, 0, 20, 418, 500], width: 52, height: 20, dir: "rtl" },
+      { str: "Genesis 2:18", transform: [14, 0, 0, 14, 477, 500], width: 75, height: 14, dir: "ltr" },
+    ]);
+    assert.equal(split[0].text, "וַיֹּאמֶר הָאָדָם לְבַּדוֹ Genesis 2:18");
+    const logical = cluster([
+      { str: "וַיֹּאמֶר", transform: [20, 0, 0, 20, 40, 400], width: 52, height: 20, dir: "ltr" },
+      { str: "הָאָדָם", transform: [20, 0, 0, 20, 110, 400], width: 52, height: 20, dir: "ltr" },
+      { str: "לְבַדּוֹ", transform: [20, 0, 0, 20, 180, 400], width: 52, height: 20, dir: "ltr" },
+    ]);
+    assert.equal(logical[0].text, "וַיֹּאמֶר הָאָדָם לְבַדּוֹ");
+  });
+
+  it("repairs the chapter title from the opening line and keeps a contents page", () => {
+    const words = new Set("teaks tears pool caucus race long tale rabbit sends little bill pig pepper mad party mau rig croquet queen ground and the".split(" "));
+    const lines: Line[] = [line("Contents", 1, 700)];
+    const rows: [string, number, string, string, string][] = [
+      ["II. The Pool of Teaks .......... 12", 2, "CHAPTER II.", "THE POOL OF TEAES.", "The pool stays."],
+      ["III. A Caucus-Race Axd a Long Tale .......... 13", 3, "CHAPTER III.", "A CAUCUS-RACE AND A LONG TALE.", "The tale stays."],
+      ["VI. Rig and Pepper .......... 14", 4, "CHAPTER VI.", "PIG AND PEPPER.", "The pepper stays."],
+      ["VII. A Mad Tea-Partv .......... 15", 5, "CHAPTER VII.", "A MAU TEA-PARTY.", "The party stays."],
+      ["VIII. The Queen's Croquet-Ground .......... 18", 6, "CHAPTER VIII.", "THE queen's CHOQUET GROUND.", "The ground stays."],
+    ];
+    rows.forEach(([text], index) => lines.push(line(text, 1, 660 - index * 22)));
+    for (const file of [2, 3, 4, 7, 8, 9, 10]) lines.push(line(String(file + 10), file, 20), line("A numbered page stays in the book.", file, 400));
+    lines.push(line("18", 6, 20));
+    for (let file = 20; file <= 30; file++) lines.push(line(String(file + 10), file, 20), line("A later numbered page stays.", file, 400));
+    for (const [, file, head, sub, body] of rows) {
+      lines.push(line(head, file, 700, { h: 16 }));
+      lines.push(line(sub, file, 640));
+      lines.push(line(body, file, 560));
+    }
+    const folio = assembleFolio(lines, {
+      title: "Alice",
+      subtitle: "",
+      sourceName: "alice.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      lexicon: { has: (word) => words.has(word) },
+    });
+    const labels = folio.toc.map((item) => item.label);
+    assert.ok(labels.some((label) => label.includes("The Pool of Tears")), labels.join(" | "));
+    assert.equal(labels.some((label) => /teaks|teaes/i.test(label)), false);
+    assert.ok(labels.some((label) => label.includes("A Caucus-Race and a Long Tale")));
+    assert.ok(labels.some((label) => label.includes("Pig and Pepper")));
+    assert.equal(labels.some((label) => /\brig\b/i.test(label)), false);
+    assert.ok(labels.some((label) => label.includes("A Mad Tea-Party")));
+    assert.equal(labels.some((label) => /mau|partv/i.test(label)), false);
+    assert.ok(labels.some((label) => label.includes("The Queen's Croquet-Ground")));
+    assert.equal(labels.some((label) => /choquet/i.test(label)), false);
+    const pool = folio.chapters.find((chapter) => /pool of tears/i.test(chapter.title));
+    const poolText = (pool?.blocks || []).flatMap((block) => block.runs || []).join(" ");
+    assert.match(poolText, /The Pool of Tears/);
+    assert.equal(/teaes|teaks/i.test(poolText), false);
+    assert.match(poolText, /CHAPTER II/);
+    const queen = folio.chapters.find((chapter) => /croquet/i.test(chapter.title));
+    const queenText = (queen?.blocks || []).flatMap((block) => block.runs || []).join(" ");
+    assert.match(queenText, /The Queen's Croquet-Ground/);
+    assert.equal(/choquet/i.test(queenText), false);
+    const tea = folio.chapters.find((chapter) => /tea-party/i.test(chapter.title));
+    assert.equal(tea?.page, 15);
+    const teaText = (tea?.blocks || []).flatMap((block) => block.runs || []).join(" ");
+    assert.match(teaText, /party stays/);
+    assert.match(teaText, /A Mad Tea-Party/);
+    assert.equal(/mau|partv/i.test(teaText), false);
+  });
+
+  it("repairs the chapter mark on the opening and dresses a heading the body confirms", () => {
+    const words = new Set("rabbit sends little bill queen croquet ground advice caterpillar stole tarts mock turtle story alice evidence and the who from".split(" "));
+    const lines: Line[] = [line("Contents", 1, 720)];
+    const rows: [string, number, string, string][] = [
+      ["IV. The Rabbit Sends in a Little Bill .......... 3", 3, "CHAPTER lY.", "THE RABBIT SENDS IN A LITTLE BILL."],
+      ["VIII. The Queen's Croquet-Ground .......... 4", 4, "CHAPTER Vlil.", "THE queen's CHOQUET GROUND."],
+      ["XI. Who Stole the Tarts .......... 5", 5, "CHAPTEft XL", "WHO STOLE THE TARTS."],
+      ["V. ADVICE FROM A CATERPILLAR .......... 6", 6, "CHAPTER V.", "ADVICE FROM A CATERPILLAR."],
+      ["IX. THE MOCK TURTLE'S STORY .......... 7", 7, "", ""],
+      ["XII. Alice's evidence .......... 8", 8, "CHAPTER XII.", "ALICES EVIDENCE."],
+    ];
+    rows.forEach(([text], index) => lines.push(line(text, 1, 680 - index * 22)));
+    for (const [, file, head, sub] of rows) {
+      lines.push(line(String(file), file, 20));
+      if (head) lines.push(line(head, file, 700, { h: 16 }));
+      if (file === 4) lines.push(line("The cool fountains.", file, 730, { x0: 40, x1: 560 }));
+      if (sub) lines.push(line(sub, file, 640));
+      lines.push(line(`The body of file ${file} stays in the chapter.`, file, 520));
+    }
+    const folio = assembleFolio(lines, {
+      title: "Alice",
+      subtitle: "",
+      sourceName: "marks.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      lexicon: { has: (word) => words.has(word) },
+    });
+    const labels = folio.toc.map((item) => item.label);
+    assert.ok(labels.includes("V. Advice from a Caterpillar"), labels.join(" | "));
+    assert.ok(labels.includes("IX. THE MOCK TURTLE'S STORY"), labels.join(" | "));
+    const prose = (title: RegExp) =>
+      (folio.chapters.find((chapter) => title.test(chapter.title))?.blocks || [])
+        .flatMap((block) => block.runs || [])
+        .filter((run) => typeof run === "string")
+        .join(" ");
+    const bill = prose(/little bill/i);
+    assert.match(bill, /CHAPTER IV/);
+    assert.equal(bill.includes("lY"), false);
+    assert.match(bill, /The Rabbit Sends in a Little Bill/);
+    const queen = prose(/croquet/i);
+    assert.match(queen, /CHAPTER VIII/);
+    assert.equal(queen.includes("fountains. CHAPTER"), false);
+    assert.match(queen, /cool fountains/);
+    assert.equal(/vlil|choquet/i.test(queen), false);
+    assert.match(queen, /The Queen's Croquet-Ground/);
+    const tarts = prose(/tarts/i);
+    assert.match(tarts, /CHAPTER XI/);
+    assert.equal(/chapteft|CHAPTER XL/i.test(tarts), false);
+    assert.match(tarts, /Who Stole the Tarts/);
+    const caterpillar = prose(/caterpillar/i);
+    assert.match(caterpillar, /Advice from a Caterpillar/);
+    assert.equal(caterpillar.includes("ADVICE FROM"), false);
+    const mockChapter = folio.chapters.find((chapter) => /MOCK TURTLE/.test(chapter.title));
+    assert.equal(mockChapter?.title, "IX. THE MOCK TURTLE'S STORY");
+    assert.match(prose(/MOCK TURTLE/), /stays in the chapter/);
+    assert.ok(labels.includes("XII. Alice's Evidence"), labels.join(" | "));
+    const evidence = prose(/evidence/i);
+    assert.match(evidence, /Alice's Evidence/);
+    assert.equal(evidence.includes("ALICES"), false);
+  });
+
+  it("joins a wrapped capital title and drops the scan marks on a contents line", () => {
+    assert.equal(contentsEntry({ text: 'How the Rhinoceros Got His Skin ."- \' • 31' })?.title, "How the Rhinoceros Got His Skin");
+    assert.equal(contentsEntry({ text: "Tiger! Tiger! .......... 87" })?.title, "Tiger! Tiger!");
+    const lines: Line[] = [
+      line("Contents", 1, 720),
+      line('How the Rhinoceros Got His Skin ."- \' • .......... 5', 1, 680),
+      line("The Beginning of the Armadillos .......... 6", 1, 658),
+      line("The Butterfly that Stamped .......... 8", 1, 636),
+    ];
+    lines.push(
+      line("5", 5, 20),
+      line("HOW THE RHINOCEROS GOT", 5, 700, { h: 16, x0: 80, x1: 420 }),
+      line("HIS SKIN", 5, 678, { h: 15, x0: 200, x1: 310 }),
+      line("Once upon a time the story stays.", 5, 600),
+      line("6", 6, 20),
+      line("THE BEGINNING OP THE", 6, 700, { h: 16, x0: 70, x1: 430 }),
+      line("ARMADILLOS", 6, 678, { h: 15, x0: 190, x1: 340 }),
+      line("This story of the tortoise stays.", 6, 600),
+      line("8", 8, 20),
+      line("THE BUTTERFLY THAT", 8, 700, { h: 16, x0: 90, x1: 400 }),
+      line("STAMPED", 8, 678, { h: 15, x0: 210, x1: 320 }),
+      line("THE LAST OP THE SPIRITS.", 8, 640, { h: 14 }),
+      line("SEE OP. CIT. IN THE NOTE", 8, 600, { h: 14 }),
+      line("The phantom stays in the chapter.", 8, 540),
+    );
+    const folio = assembleFolio(lines, {
+      title: "Stories",
+      subtitle: "",
+      sourceName: "wrap.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      lexicon: { has: (word) => word.length >= 2 },
+    });
+    const labels = folio.toc.map((item) => item.label);
+    assert.ok(labels.some((label) => label === "How the Rhinoceros Got His Skin"), labels.join(" | "));
+    assert.equal(labels.some((label) => /["•]/.test(label)), false);
+    assert.ok(labels.some((label) => label === "The Beginning of the Armadillos"), labels.join(" | "));
+    const prose = (title: RegExp) =>
+      (folio.chapters.find((chapter) => title.test(chapter.title))?.blocks || [])
+        .flatMap((block) => block.runs || [])
+        .filter((run) => typeof run === "string")
+        .join("\n");
+    const rhino = prose(/rhinoceros/i);
+    assert.match(rhino, /Once upon a time the story stays/);
+    assert.equal(/HOW THE RHINOCEROS|HIS SKIN/.test(rhino), false);
+    const beginning = prose(/armadillo/i);
+    assert.equal(/\bOP\b/.test(beginning), false);
+    assert.equal(/\bARMADILLOS\b/.test(beginning), false);
+    assert.match(beginning, /tortoise stays/);
+    const stave = prose(/butterfly/i);
+    assert.match(stave, /THE LAST OF THE SPIRITS/);
+    assert.equal(stave.includes("OP THE"), false);
+    assert.match(stave, /OP\. CIT\./);
+    assert.equal(/THE BUTTERFLY THAT\b/.test(stave), false);
+    assert.match(stave, /phantom stays/);
+  });
+
+  it("drops a running head whose wording changes and keeps one sentence", () => {
+    const lines: Line[] = [];
+    for (const page of [1, 2, 3]) {
+      lines.push(line("THE TARTS", page, 770, { pageH: 800 }));
+      lines.push(line("The court of hearts goes on with the trial today.", page, 640, { pageH: 800 }));
+    }
+    lines.push(line("WHO STOLE THE TARTS f 163", 4, 770, { pageH: 800 }));
+    lines.push(line("The trial sentence continues after the head.", 4, 640, { pageH: 800 }));
+    lines.push(line("Who stole the tarts?", 5, 760, { pageH: 800 }));
+    lines.push(line("That question is the whole of the evidence.", 5, 640, { pageH: 800 }));
+    const folio = assembleFolio(lines, { title: "Trial", subtitle: "", sourceName: "t.pdf", emptyMessage: "empty", skipEpub: true });
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).filter((run) => typeof run === "string").join(" ");
+    assert.match(prose, /Who stole the tarts\?/);
+    assert.equal(prose.includes("TARTS f"), false);
+    assert.equal(prose.includes("THE TARTS"), false);
+    assert.match(prose, /court of hearts/);
+    assert.match(prose, /trial sentence continues/);
+  });
+
+  it("does not open the same book from a running head", () => {
+    const page = { pageH: 428, pageW: 280 };
+    const lines: Line[] = [
+      line("BOOK IV", 10, 320, { ...page, h: 11 }),
+      line("The mastery of the mind stays in this one book.", 10, 280, { ...page }),
+    ];
+    for (const [n, head] of [
+      [11, "' BOOK IV"],
+      [12, "BOOK IV ."],
+      [13, ". BOOK IV"],
+      [14, "BOOK VI ."],
+    ] as const) {
+      lines.push(line(head, n, 400, { ...page, h: 11 }));
+      lines.push(line("The same book continues with another sentence here.", n, 280, { ...page }));
+    }
+    lines.push(line("BOOK V", 15, 320, { ...page, h: 11 }));
+    lines.push(line("A later book starts once and only once.", 15, 280, { ...page }));
+    const folio = assembleFolio(lines, { title: "Marcus", subtitle: "", sourceName: "m.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.filter((label) => /book iv\b/i.test(label)).length, 1);
+    assert.equal(labels.filter((label) => /book v\b/i.test(label)).length, 1);
+    assert.equal(labels.some((label) => /book vi\b/i.test(label)), false);
+    const prose = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).filter((run) => typeof run === "string").join(" ");
+    assert.match(prose, /mastery of the mind/);
+    assert.match(prose, /later book starts/);
+    assert.equal(prose.includes("' BOOK"), false);
+  });
+
+  it("splits a full-width crib without joining it to the english", () => {
+    const lines: Line[] = [];
+    let y = 640;
+    const band = ["one", "two", "three", "four", "five"];
+    for (let n = 0; n < 5; n++) {
+      lines.push(line(`iti akarnya atmanas putranam anadhigata line ${band[n]}`, 4, y, { h: 8.6, x0: 40, x1: 460 }));
+      y -= 12;
+      lines.push(line(`Ind karn with a Ger man note ${band[n]}`, 4, y, { h: 6.8, x0: 40, x1: 460 }));
+      y -= 12;
+      lines.push(line(`Thus having heard of himself of the sons ${band[n]}`, 4, y, { h: 8.1, x0: 40, x1: 460 }));
+      y -= 16;
+    }
+    lines.push(line("iti akarnya the sanskrit line stays whole", 4, y, { h: 8.4, x0: 40, x1: 460 }));
+    y -= 12;
+    lines.push(line("Ind karn the grammar note stays whole", 4, y, { h: 6.1, x0: 40, x1: 460 }));
+    y -= 11;
+    lines.push(line("sg. m. N.sg. Par. stays", 4, y, { h: 7, x0: 40, x1: 145 }));
+    y -= 12;
+    lines.push(line("Thus the sense stays with the translation", 4, y, { h: 8.2, x0: 40, x1: 460 }));
+    y -= 12;
+    lines.push(line("whom", 4, y, { h: 11.2, x0: 40, x1: 67 }));
+    const folio = assembleFolio(lines, { title: "Hitopadesa", subtitle: "", sourceName: "h.pdf", emptyMessage: "empty", skipEpub: true });
+    const texts = folio.chapters.flatMap((chapter) => chapter.blocks).map((block) => (block.runs || []).filter((run) => typeof run === "string").join(" "));
+    assert.equal(texts.some((text) => text.includes("Ind karn") && text.includes("Thus having")), false);
+    assert.equal(texts.some((text) => text.includes("iti akarnya") && text.includes("Ind karn")), false);
+    const grammar = texts.find((text) => text.includes("grammar note"));
+    const english = texts.find((text) => text.includes("sense stays"));
+    assert.match(grammar || "", /N\.sg\. Par\. stays/);
+    assert.match(english || "", /\bwhom\b/);
+    assert.equal((grammar || "").includes("sense stays"), false);
+    assert.equal((english || "").includes("N.sg"), false);
+  });
+
+  it("keeps a contents title when the page number is glued on", () => {
+    const lines: Line[] = [line("Contents", 2, 720)];
+    const rows = [
+      ["Mowgli's Brothers ..... 3", 3, "MOWGLI'S BROTHERS", "The brothers stay."],
+      ["'Tiger! Tiger!' . . . . -87", 87, "TIGER! TIGER!", "The tiger stays."],
+      ["The Beginning of the Armadillos . lOI", 101, "THE BEGINNING OF THE ARMADILLOS", "The armadillos stay."],
+      ["How the First Letter was Written . 123", 123, "HOW THE FIRST LETTER WAS WRITTEN", "The letter stays."],
+      ["The White Seal ... 127", 127, "THE WHITE SEAL", "The seal stays."],
+    ] as const;
+    rows.forEach(([row], index) => lines.push(line(row, 2, 680 - index * 22)));
+    for (const [, page, head, body] of rows) {
+      lines.push(line(String(page), page, 20));
+      lines.push(line(head, page, 640, { h: 16 }));
+      lines.push(line(body, page, 600));
+    }
+    const folio = assembleFolio(lines, { title: "Jungle", subtitle: "", sourceName: "j.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.some((label) => /tiger! tiger!/i.test(label)), true);
+    assert.equal(labels.some((label) => /armadillos/i.test(label)), true);
+    assert.equal(labels.some((label) => /first letter/i.test(label)), true);
+    assert.equal(labels.some((label) => /white seal/i.test(label)), true);
+    assert.equal(labels.some((label) => /mowgli's song/i.test(label) && /white seal/i.test(label)), false);
+    const tiger = folio.chapters.find((chapter) => /tiger/i.test(chapter.title));
+    const seal = folio.chapters.find((chapter) => /white seal/i.test(chapter.title));
+    const letter = folio.chapters.find((chapter) => /first letter/i.test(chapter.title));
+    assert.match((tiger?.blocks || []).flatMap((block) => block.runs || []).join(" "), /tiger stays/);
+    assert.equal((tiger?.blocks || []).flatMap((block) => block.runs || []).join(" ").includes("seal stays"), false);
+    assert.match((seal?.blocks || []).flatMap((block) => block.runs || []).join(" "), /seal stays/);
+    assert.match((letter?.blocks || []).flatMap((block) => block.runs || []).join(" "), /letter stays/);
+  });
+
+  it("does not take a publisher's list for the chapters", () => {
+    const lines: Line[] = [
+      line("Male .......... 3", 2, 680),
+      line("One Act. By Mrs. Planche .......... 5", 2, 660),
+      line("Female characters .......... 24", 2, 640),
+      line("Female .......... 29", 2, 620),
+      line("A preface stays in front.", 1, 400),
+    ];
+    for (const page of [3, 5, 24, 29]) lines.push(line(String(page), page, 20));
+    lines.push(line("STAVE ONE.", 5, 640, { h: 16 }));
+    lines.push(line("Marley was dead to begin with today.", 5, 600));
+    lines.push(line("The register of his burial stays in the first stave.", 5, 580));
+    lines.push(line("STAVE TWO.", 20, 640, { h: 16 }));
+    lines.push(line("20", 20, 20));
+    lines.push(line("The second stave stays in its own chapter.", 20, 600));
+    const folio = assembleFolio(lines, { title: "Carol", subtitle: "", sourceName: "c.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.includes("Male"), false);
+    assert.equal(labels.includes("Female"), false);
+    assert.equal(labels.some((label) => /planche/i.test(label)), false);
+    assert.equal(labels.some((label) => /stave one/i.test(label)), true);
+    assert.equal(labels.some((label) => /stave two/i.test(label)), true);
+    const first = folio.chapters.find((chapter) => /stave one/i.test(chapter.title));
+    const second = folio.chapters.find((chapter) => /stave two/i.test(chapter.title));
+    assert.match((first?.blocks || []).flatMap((block) => block.runs || []).join(" "), /dead to begin/);
+    assert.match((second?.blocks || []).flatMap((block) => block.runs || []).join(" "), /second stave stays/);
   });
 });
 

@@ -1,9 +1,9 @@
 import type { Line } from "./assemble.ts";
-import { mergeScriptLines, readablePicture } from "./cases.ts";
+import { keepPageLanguage, pageLooksMixed, readablePicture } from "./cases.ts";
 import type { OcrKind } from "./settings.ts";
 import { loadVision } from "./ocr-vision.ts";
 import { loadPp, readPpPage } from "./ocr-pp.ts";
-import { looksScrappy, PROBE_ORDER, scriptHits, scriptLabel, type ReaderScript } from "./script.ts";
+import { looksScrappy, PROBE_ORDER, scriptLabel, type ReaderScript } from "./script.ts";
 import { checkpoint } from "./job.ts";
 
 export type PicturePage = {
@@ -74,37 +74,34 @@ async function readMixed(
 ): Promise<{ lines: Line[]; script: ReaderScript }> {
   const useEnglish = allowed.includes("en");
   const english = useEnglish ? await readPpPage(canvas, page.n, page.pageW, page.pageH, "en") : [];
-  const enText = pageText(english);
-  const enOk = useEnglish && !looksScrappy(enText);
+  const enOk = useEnglish && !looksScrappy(pageText(english));
   const order = scriptOrder(allowed, known);
   if (!order.length) return { lines: english, script: "en" };
   const preferred = order.filter((id) => known.includes(id));
+  // A uniform English page does not need another reader. A mixed page, or a book that already uses one, does.
+  if (enOk && !pageLooksMixed(english) && !preferred.length) return { lines: english, script: "en" };
   const passes = preferred.length ? preferred : order;
-  let lines = english;
-  let script: ReaderScript = "en";
   for (const candidate of passes) {
     if (!known.includes(candidate)) {
       onStatus?.(
-        enOk
-          ? `Trying the ${scriptLabel(candidate)} reader beside English.`
-          : `The English reader found scraps. Trying the ${scriptLabel(candidate)} reader.`,
+        !useEnglish
+          ? `Trying the ${scriptLabel(candidate)} reader.`
+          : enOk
+            ? `Trying the ${scriptLabel(candidate)} reader on the other passage.`
+            : `The English reader found scraps. Trying the ${scriptLabel(candidate)} reader.`,
       );
     }
     try {
       const read = await readPpPage(canvas, page.n, page.pageW, page.pageH, candidate);
-      const text = pageText(read);
-      const hit = candidate === "latin" ? !looksScrappy(text) : scriptHits(text, candidate) >= 8;
-      if (!hit) continue;
+      const choice = keepPageLanguage(english, read, candidate);
+      if (choice.script === "en") continue;
       if (!known.includes(candidate)) known.push(candidate);
-      if (useEnglish && enOk) lines = mergeScriptLines(lines, read, candidate);
-      else if (script === "en") lines = read;
-      else lines = mergeScriptLines(lines, read, candidate);
-      script = candidate;
+      return choice;
     } catch {
       /* a reader that will not start leaves the reading already kept */
     }
   }
-  return { lines: lines.length ? lines : english, script };
+  return { lines: english, script: "en" };
 }
 
 export async function readPicturePages(
@@ -154,7 +151,7 @@ export async function readPicturePages(
           if (!used.has(found.script)) {
             used.add(found.script);
             const note = englishOn
-              ? `Picture pages can use the ${scriptLabel(found.script)} reader beside English.`
+              ? `Pages in ${scriptLabel(found.script)} stay in that language. A page that also has English keeps both.`
               : `Picture pages are read with the ${scriptLabel(found.script)} reader.`;
             warning = warning ? `${warning} ${note}` : note;
           }

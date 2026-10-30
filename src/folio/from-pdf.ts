@@ -6,7 +6,7 @@ import { composeFolio } from "./compose";
 import { pictureScale } from "./picture";
 import { loadVision } from "./ocr-vision";
 import { readPicturePages } from "./pictures";
-import { needsPicture, scriptIn, scriptLabel } from "./script";
+import { looksMangled, needsPicture, scriptIn, scriptLabel } from "./script";
 import { jpegFromRgba } from "./cover";
 import { loadPdfjs, pdfAssetOptions } from "./pdf-local";
 import { checkpoint } from "./job";
@@ -105,6 +105,7 @@ export async function folioFromPdf(
   }
   const lines: Line[] = [];
   const empty: number[] = [];
+  const mangledPages = new Set<number>();
   const size = new Map<number, { w: number; h: number }>();
   try {
     for (let n = 1; n <= doc.numPages; n++) {
@@ -116,17 +117,23 @@ export async function folioFromPdf(
     const clustered = cluster(content.items as { str: string; transform: number[]; width?: number; height?: number }[]);
     page.cleanup();
     const text = clustered.map((line) => line.text).join(" ");
-    if (!clustered.length || needsPicture(text)) empty.push(n);
+    const mangled = settings.pictures === "empty" && settings.scripts.some((id) => id !== "en") && looksMangled(text);
+    if (mangled) {
+      mangledPages.add(n);
+      empty.push(n);
+      for (const ln of clustered) lines.push({ ...ln, page: n, pageH: view.height, pageW: view.width });
+    } else if (!clustered.length || needsPicture(text)) empty.push(n);
     else for (const ln of clustered) lines.push({ ...ln, page: n, pageH: view.height, pageW: view.width });
     await breathe();
   }
   let warning: string | undefined;
   if (empty.length) {
-    onStatus?.(
-      settings.pictures === "empty"
-        ? `${empty.length} ${empty.length === 1 ? "page has" : "pages have"} no text`
-        : `${empty.length} ${empty.length === 1 ? "page has" : "pages have"} no text. Pictures of pages is off.`,
-    );
+    const blanks = empty.length - mangledPages.size;
+    const parts: string[] = [];
+    if (blanks && blanks >= doc.numPages * 0.8) parts.push(`No text layer on ${blanks} of ${doc.numPages} pages`);
+    else if (blanks) parts.push(`${blanks} ${blanks === 1 ? "page has" : "pages have"} no text`);
+    if (mangledPages.size) parts.push(`${mangledPages.size} ${mangledPages.size === 1 ? "page is" : "pages are"} in a broken fount`);
+    onStatus?.(settings.pictures === "empty" ? `${parts.join(". ")}.` : `${parts.join(". ")}. Pictures of pages is off.`);
   } else {
     onStatus?.("Every page already had text");
   }
@@ -162,6 +169,12 @@ export async function folioFromPdf(
         script,
         settings.scripts,
       );
+      const pictured = new Set(read.lines.map((line) => line.page));
+      if (pictured.size && mangledPages.size) {
+        for (let i = lines.length - 1; i >= 0; i--) {
+          if (mangledPages.has(lines[i].page) && pictured.has(lines[i].page)) lines.splice(i, 1);
+        }
+      }
       lines.push(...read.lines);
       warning = read.warning;
       if (!warning) onStatus?.(`Read ${empty.length} picture ${empty.length === 1 ? "page" : "pages"}`);

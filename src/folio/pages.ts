@@ -83,6 +83,11 @@ function candidates(text: string): Cand[] {
   if (slash) add(slash[1], 3, true);
   const pageWord = t.match(/\b(?:page|p)\.?\s*([0-9]{1,4}|[ivxlcdm]{1,8})\b/i);
   if (pageWord) add(pageWord[1], 3, false);
+  // "166" drawn as "1" then "66", a hairline apart, so the line reads "1 66 THE TIME MACHINE."
+  const splitLead = t.match(/^(\d)\s+(\d{2,3})(?=\s|$)/);
+  const splitTail = t.match(/(\d)\s+(\d{2,3})$/);
+  const split = splitLead || (splitTail != null && (splitTail.index ?? 0) > 0 ? splitTail : null);
+  if (split) add(split[1] + split[2], 2, true);
   add(t, 3, true);
   const parts = t.split(/\s+/);
   if (parts.length > 1 && !slash && !pageWord) {
@@ -246,6 +251,15 @@ export function detectPrinted(lines: PageLine[]): PrintedPages {
       if (value >= 1) labels.set(file, toRoman(value));
     }
   } else return fallback;
+
+  // A chapter's first page often has no number. The next sheet is 2, so this one is 1.
+  if (![...labels.values()].includes(1)) {
+    for (const [file, value] of labels) {
+      if (value !== 2 || labels.has(file - 1)) continue;
+      labels.set(file - 1, 1);
+      break;
+    }
+  }
 
   const seen = new Set<string>();
   for (const label of labels.values()) {

@@ -1801,7 +1801,7 @@ function SettingsSheet({
           <Choice
             on={settings.pictures === "empty"}
             label="Empty pages"
-            hint="Read a page only when it has no text. A page that already has text is left alone."
+            hint="Read a blank page. Leave a page that already reads as a language. When another script is on, a page of broken letters is read again, and a page that prints both keeps both."
             onPick={() => onChange({ ...settings, pictures: "empty" })}
           />
         </div>
@@ -1823,7 +1823,7 @@ function SettingsSheet({
               key={choice.id}
               on={settings.scripts.includes(choice.id)}
               label={choice.label}
-              hint={`${choice.hint}. ${formatBytes(choice.bytes)}. Off until this is on. Turning it on stores the reader, and a picture page that needs it is read again.`}
+              hint={`${choice.hint}. ${formatBytes(choice.bytes)}. Off until this is on. A page of this script stays whole. A page that prints it with English keeps both, in the order they are printed.`}
               onPick={() => void toggleScript(choice.id)}
             />
           ))}

@@ -1,5 +1,5 @@
 import type { Line } from "./assemble.ts";
-import { scriptHits, type ReaderScript } from "./script.ts";
+import { looksScrappy, lineScript, otherScriptText, scriptHits, type ReaderScript } from "./script.ts";
 
 /**
  * Hard pages are not read as one stream of lines.
@@ -52,6 +52,61 @@ export function mergeScriptLines(english: Line[], other: Line[], script: ReaderS
   });
   kept.sort((a, b) => b.y - a.y || a.x0 - b.x0);
   return kept;
+}
+
+/**
+ * A page of one language stays that language.
+ * A page that prints both keeps both, where they were printed. The second script fills the gap; it is not laid over a line that already reads as English.
+ * A page of scraps gives way to the script that actually reads it.
+ */
+export function keepPageLanguage(english: Line[], other: Line[], script: ReaderScript): { lines: Line[]; script: ReaderScript } {
+  const textOf = (lines: Line[]) => lines.map((line) => line.text).join(" ");
+  const enOk = english.some((line) => line.text.trim()) && !looksScrappy(textOf(english));
+  if (!otherReads(other, script)) return { lines: english, script: "en" };
+  if (!enOk) return { lines: other, script };
+  const solid = english.filter(isSolidEnglish);
+  const base = solid.length >= 2 ? solid : english;
+  const extra = genuineLines(other, script).filter((line) => !base.some((kept) => overlaps(kept, line)));
+  const letters = extra.reduce((n, line) => n + scriptHits(line.text, script), 0);
+  if (extra.length < 2 || letters < 24) return { lines: english, script: "en" };
+  const merged = [...base, ...extra].sort((a, b) => b.y - a.y || a.x0 - b.x0);
+  return { lines: merged, script };
+}
+
+function wordCount(text: string) {
+  return (text.match(/[A-Za-z]{3,}/g) || []).length;
+}
+
+function isSolidEnglish(line: Line) {
+  return wordCount(line.text) >= 3;
+}
+
+/** The English read has a real passage and another passage that is not English. Two stray marks do not count. */
+export function pageLooksMixed(lines: Line[]) {
+  let wordish = 0;
+  let odd = 0;
+  for (const line of lines) {
+    const text = line.text.trim();
+    if (text.length < 2) continue;
+    const words = wordCount(text);
+    const letters = text.match(/\p{L}/gu) || [];
+    let nonLatin = 0;
+    for (const ch of letters) if (!/\p{Script=Latin}/u.test(ch)) nonLatin += 1;
+    if (nonLatin >= 4 || (words < 2 && letters.length >= 4)) odd += 1;
+    else if (words >= 2) wordish += 1;
+  }
+  return wordish >= 2 && odd >= 2 && odd * 2 >= wordish;
+}
+
+function genuineLines(lines: Line[], script: ReaderScript) {
+  if (script === "latin") return lines.filter((line) => wordCount(line.text) >= 3);
+  return lines.filter((line) => scriptHits(line.text, script) >= 4 && lineScript(line.text) === script);
+}
+
+function otherReads(lines: Line[], script: ReaderScript) {
+  const text = lines.map((line) => line.text).join(" ");
+  if (script === "latin") return lines.some((line) => line.text.trim()) && !looksScrappy(text);
+  return genuineLines(lines, script).length > 0 && scriptHits(text, script) >= 8;
 }
 
 function squash(text: string) {
@@ -173,6 +228,7 @@ function pictureShard(text: string) {
   const letters = (text.match(/\p{L}/gu) || []).length;
   const junk = (text.match(/[\\^|~<>[\]{}#@=+`/]/g) || []).length;
   if (!junk) return false;
+  if (otherScriptText(text) && junk <= letters * 0.2) return false;
   if (words.length >= 2 && letters >= 12 && junk <= letters * 0.15) return false;
   if (words.length >= 1 && letters >= 8 && junk <= 2) return false;
   return junk >= 2 || letters < 8;

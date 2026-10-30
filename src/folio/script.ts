@@ -69,6 +69,55 @@ export function scriptHits(text: string, id: ReaderScript) {
   return script ? count(text, script.re) : 0;
 }
 
+/** The language of one line, when there are enough letters to tell. */
+export function lineScript(text: string): ReaderScript | "" {
+  const letters = text.match(/\p{L}/gu) || [];
+  if (letters.length < 6) return "";
+  let best: ReaderScript | "" = "";
+  let bestCount = 0;
+  let nonLatin = 0;
+  for (const ch of letters) if (!/\p{Script=Latin}/u.test(ch)) nonLatin += 1;
+  for (const script of EXTRA) {
+    const found = count(text, script.re);
+    if (found > bestCount) {
+      best = script.id;
+      bestCount = found;
+    }
+  }
+  const latin = letters.length - nonLatin;
+  if (nonLatin >= 6 && nonLatin > latin) return best;
+  if (latin >= 6) return "en";
+  return "";
+}
+
+/** A run of another script, not a Latin word with a stray mark. */
+export function otherScriptText(text: string) {
+  const letters = text.match(/\p{L}/gu) || [];
+  if (letters.length < 8) return false;
+  let other = 0;
+  for (const ch of letters) if (!/\p{Script=Latin}/u.test(ch)) other += 1;
+  return other >= 8 && other > letters.length - other;
+}
+
+/**
+ * Latin letters that are not a language. A Greek fount mapped onto Latin
+ * mixes capitals inside ordinary words. Real English, real Latin, and a
+ * page of capitals do not.
+ */
+export function looksMangled(text: string) {
+  if (scriptIn(text) !== "en") return false;
+  const tokens = text.split(/\s+/).filter((token) => /[A-Za-z]/.test(token));
+  if (tokens.length < 40) return false;
+  const internal = tokens.filter((token) => /[a-z][A-Z]|[A-Z]{2,}[a-z]/.test(token)).length;
+  return internal >= 18 && internal / tokens.length >= 0.12;
+}
+
+/** No usable text, or a broken fount when a reader for another script is on. */
+export function pageNeedsPicture(text: string, scripts: readonly ReaderScript[]) {
+  if (needsPicture(text)) return true;
+  return scripts.some((id) => id !== "en") && looksMangled(text);
+}
+
 /** An English reading that is not words. A picture of another script looks like this. */
 export function looksScrappy(text: string) {
   const tokens = text.split(/\s+/).filter(Boolean);
