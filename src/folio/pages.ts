@@ -165,23 +165,37 @@ function agreedArabic(obs: { file: number; value: number; weight: number }[]) {
 }
 
 function paintArabic(labels: Map<number, number | string>, chosen: { file: number; value: number }[]) {
-  const used = new Set([...labels.values()].map((label) => String(label)));
-  const put = (file: number, value: number) => {
-    if (value < 1 || labels.has(file)) return;
-    const key = String(value);
-    if (used.has(key)) return;
-    used.add(key);
-    labels.set(file, value);
-  };
-  for (let i = 0; i < chosen.length; i++) {
-    const a = chosen[i];
-    put(a.file, a.value);
-    const b = chosen[i + 1];
-    if (!b) continue;
-    const fileGap = b.file - a.file;
-    const valueGap = b.value - a.value;
-    if (fileGap > 1 && fileGap < 12 && fileGap === valueGap) {
-      for (let k = 1; k < fileGap; k++) put(a.file + k, a.value + k);
+  const runs: { file: number; value: number }[][] = [];
+  let run: { file: number; value: number }[] = [];
+  let last = 0;
+  for (const item of chosen) {
+    if (run.length && item.value <= 2 && last >= item.value + 4) {
+      runs.push(run);
+      run = [];
+    }
+    run.push(item);
+    last = item.value;
+  }
+  if (run.length) runs.push(run);
+  for (const part of runs) {
+    const used = new Set<string>();
+    const put = (file: number, value: number) => {
+      if (value < 1 || labels.has(file)) return;
+      const key = String(value);
+      if (used.has(key)) return;
+      used.add(key);
+      labels.set(file, value);
+    };
+    for (let i = 0; i < part.length; i++) {
+      const a = part[i];
+      put(a.file, a.value);
+      const b = part[i + 1];
+      if (!b) continue;
+      const fileGap = b.file - a.file;
+      const valueGap = b.value - a.value;
+      if (fileGap > 1 && fileGap < 12 && fileGap === valueGap) {
+        for (let k = 1; k < fileGap; k++) put(a.file + k, a.value + k);
+      }
     }
   }
 }
@@ -265,10 +279,20 @@ export function detectPrinted(lines: PageLine[]): PrintedPages {
   }
 
   const seen = new Set<string>();
-  for (const label of labels.values()) {
+  let lastNum = 0;
+  for (const file of files) {
+    const label = labels.get(file);
+    if (label == null) continue;
     const key = String(label);
+    if (typeof label === "number" && lastNum >= label + 4 && label <= 2) {
+      seen.clear();
+      seen.add(key);
+      lastNum = label;
+      continue;
+    }
     if (seen.has(key)) return fallback;
     seen.add(key);
+    if (typeof label === "number") lastNum = label;
   }
   return { label: (filePage) => (labels.has(filePage) ? labels.get(filePage)! : null) };
 }

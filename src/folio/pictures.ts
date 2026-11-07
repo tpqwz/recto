@@ -1,10 +1,12 @@
 import type { Line } from "./assemble.ts";
-import { keepPageLanguage, pageLooksMixed, readablePicture } from "./cases.ts";
+import { figurePage, keepPageLanguage, pageLooksMixed, readablePicture } from "./cases.ts";
 import type { OcrKind } from "./settings.ts";
 import { loadVision } from "./ocr-vision.ts";
 import { loadPp, readPpPage } from "./ocr-pp.ts";
 import { looksScrappy, PROBE_ORDER, scriptLabel, type ReaderScript } from "./script.ts";
 import { checkpoint } from "./job.ts";
+import { jpegFromRgba } from "./cover.ts";
+import { keepDarkInk } from "./picture.ts";
 
 export type PicturePage = {
   n: number;
@@ -14,6 +16,48 @@ export type PicturePage = {
 };
 
 const VISION_FALLBACK = "The vision model did not start. Empty pages were read with PP-OCR.";
+
+function washGhost(canvas: HTMLCanvasElement) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx || canvas.width < 8 || canvas.height < 8) return;
+  try {
+    const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    if (keepDarkInk(frame.data, canvas.width, canvas.height)) ctx.putImageData(frame, 0, 0);
+  } catch {
+    /* a canvas that cannot be read is still offered to the reader */
+  }
+}
+
+function plateOf(canvas: HTMLCanvasElement, page: PicturePage): Line | null {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  try {
+    const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const raw = jpegFromRgba(canvas.width, canvas.height, frame.data);
+    if (!raw) return null;
+    return {
+      text: " ",
+      y: Math.max(36, page.pageH - 36),
+      x0: 36,
+      x1: Math.max(72, page.pageW - 36),
+      h: Math.max(36, page.pageH - 72),
+      page: page.n,
+      pageH: page.pageH,
+      pageW: page.pageW,
+      plate: { data: `data:image/jpeg;base64,${raw}`, w: page.pageW, h: page.pageH },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function keptLines(canvas: HTMLCanvasElement, page: PicturePage, found: Line[]) {
+  if (figurePage(found)) {
+    const plate = plateOf(canvas, page);
+    if (plate) return [plate];
+  }
+  return readablePicture(found) ? found : [];
+}
 
 function pageText(lines: Line[]) {
   return lines.map((line) => line.text).join(" ");
@@ -41,11 +85,12 @@ async function readKind(
     );
     try {
       const canvas = await page.draw();
+      washGhost(canvas);
       const found =
         kind === "pp"
           ? await readPpPage(canvas, page.n, page.pageW, page.pageH, script)
           : await vision!.read(canvas, page.n, page.pageW, page.pageH);
-      lines.push(...(readablePicture(found) ? found : []));
+      lines.push(...keptLines(canvas, page, found));
       canvas.width = 0;
       canvas.height = 0;
     } catch {
@@ -145,6 +190,7 @@ export async function readPicturePages(
       let canvas: HTMLCanvasElement | null = null;
       try {
         canvas = await page.draw();
+        washGhost(canvas);
         const found = await readMixed(canvas, page, allowed, known, onStatus);
         if (found.script !== "en") {
           onStatus?.(`${scriptLabel(found.script)} reader, page ${page.n} of ${total}`);
@@ -156,7 +202,7 @@ export async function readPicturePages(
             warning = warning ? `${warning} ${note}` : note;
           }
         }
-        lines.push(...(readablePicture(found.lines) ? found.lines : []));
+        lines.push(...keptLines(canvas, page, found.lines));
       } catch {
         failed++;
       } finally {

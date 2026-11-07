@@ -60,6 +60,51 @@ export function linesFromBoxes(
   return lines;
 }
 
+/** Pale letters from the other side of thin paper. Dark ink, and the gray edge of that ink, stays. */
+export function keepDarkInk(rgba: Uint8Array | Uint8ClampedArray, width: number, height: number): number {
+  const count = width * height;
+  if (width < 8 || height < 8 || rgba.length < count * 4) return 0;
+  const lumAt = (index: number) => {
+    const at = index * 4;
+    return (rgba[at] * 3 + rgba[at + 1] * 6 + rgba[at + 2]) / 10;
+  };
+  const step = Math.max(1, Math.floor(count / 80000));
+  let dark = 0;
+  let pale = 0;
+  let seen = 0;
+  for (let i = 0; i < count; i += step) {
+    const lum = lumAt(i);
+    if (lum < 85) dark++;
+    else if (lum >= 130 && lum <= 205) pale++;
+    seen++;
+  }
+  if (dark < seen * 0.004 || pale < seen * 0.004 || pale < dark * 0.35) return 0;
+  const near = new Uint8Array(count);
+  const radius = 2;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (lumAt(y * width + x) >= 90) continue;
+      const y0 = Math.max(0, y - radius);
+      const y1 = Math.min(height - 1, y + radius);
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(width - 1, x + radius);
+      for (let yy = y0; yy <= y1; yy++) near.fill(1, yy * width + x0, yy * width + x1 + 1);
+    }
+  }
+  let dropped = 0;
+  for (let i = 0; i < count; i++) {
+    if (near[i]) continue;
+    const lum = lumAt(i);
+    if (lum < 125 || lum > 210) continue;
+    const at = i * 4;
+    rgba[at] = 255;
+    rgba[at + 1] = 255;
+    rgba[at + 2] = 255;
+    dropped++;
+  }
+  return dropped;
+}
+
 function takeRegions(node: unknown, into: PictureBox[]) {
   if (!node || typeof node !== "object") return;
   if (Array.isArray(node)) {

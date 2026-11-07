@@ -312,6 +312,13 @@ export function questionLine(text: string) {
   if (lower.length >= 2 && lower.length > upper.length) return true;
   return /\?\s*$/.test(title) && lower.length >= 1;
 }
+
+/** "Sincerely," closes a letter. The name on the next line is not part of the sentence. */
+export function signOff(text: string) {
+  return /^(?:sincerely|yours truly|yours sincerely|very truly yours|cordially|respectfully|devotedly yours|as ever|best regards|warm regards),?$/i.test(
+    text.replace(/\s+/g, " ").trim(),
+  );
+}
 /** A new line in a play or a transcript: "Nora. There is", "HELMER. Don't", "DR PAULING; Well", "Helmer (in his room). Is". */
 export function speechOpen(text: string) {
   const title = text.replace(/\s+/g, " ").trim();
@@ -443,6 +450,82 @@ function tightVerse(lines: Line[]) {
   return lower >= wrapped.length * 0.6;
 }
 
+/** A short letter: a greeting or a sign-off, and more than one sentence. It is not a poem. */
+function notePage(lines: Line[]) {
+  if (lines.length < 4 || lines.length > 28) return false;
+  const sign = lines.some((line) => signOff(line.text));
+  const dear = lines.some((line) => /^dear\b/i.test(line.text.replace(/\s+/g, " ").trim()));
+  if (!sign && !dear) return false;
+  const sentences = lines.filter((line) => /[.!?]["'”’]?\s*$/.test(line.text.trim())).length;
+  return sentences >= 2;
+}
+
+/** Labels scattered on a drawing. A poem and a letter share one margin, and their lines are longer. */
+export function figurePage(lines: Line[]) {
+  const body = lines.filter((line) => !line.plate && line.text.replace(/\s+/g, " ").trim().length > 1);
+  if (body.length < 8) return false;
+  const pageW = body[0].pageW || 1;
+  const widths = body.map((line) => line.x1 - line.x0).sort((a, b) => a - b);
+  if (widths[Math.floor(widths.length / 2)] > pageW * 0.28) return false;
+  const xs = body.map((line) => line.x0).sort((a, b) => a - b);
+  const spread = xs[Math.floor(xs.length * 0.8)] - xs[Math.floor(xs.length * 0.15)];
+  if (spread < pageW * 0.18) return false;
+  const prose = body.filter((line) => line.x1 - line.x0 > pageW * 0.45 && (line.text.match(/\p{L}{3,}/gu) || []).length >= 5).length;
+  return prose < 3;
+}
+
+/** "Washington-" read one line early. It belongs on the line it was torn from. */
+function pullHyphenTail(lines: Line[]) {
+  const out: Line[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const next = lines[i + 1];
+    const tail = line.text.replace(/\s+/g, " ").trim();
+    if (
+      next &&
+      !line.plate &&
+      !next.plate &&
+      next.page === line.page &&
+      /^[\p{L}][\p{L}'’]{2,}-$/u.test(tail) &&
+      tail.length <= 18 &&
+      Math.abs(line.x0 - next.x0) <= 48 &&
+      next.text.trim().split(/\s+/).length >= 3
+    ) {
+      out.push({
+        ...next,
+        text: `${tail} ${next.text.replace(/\s+/g, " ").trim()}`,
+        x0: Math.min(line.x0, next.x0),
+      });
+      i++;
+      continue;
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+/** Names in a narrow margin beside a letter. They are not lines of the letter. */
+function liftMargin(lines: Line[]) {
+  const pageW = lines[0]?.pageW || 1;
+  const prose = lines.filter((line) => !line.plate && line.x1 - line.x0 > pageW * 0.42 && (line.text.match(/\p{L}{3,}/gu) || []).length >= 4);
+  if (prose.length < 4) return lines;
+  const rights = prose.map((line) => line.x1).sort((a, b) => a - b);
+  const letterRight = rights[Math.floor(rights.length / 2)];
+  const names = lines.filter((line) => {
+    if (line.plate || line.role) return false;
+    const text = line.text.replace(/\s+/g, " ").trim();
+    if (!/^[\p{Lu}][\p{L}'’.-]+(?:\s+[\p{Lu}][\p{L}'’.-]+){0,4}$/u.test(text)) return false;
+    if (line.x1 - line.x0 > pageW * 0.32) return false;
+    if (line.x0 > pageW * 0.28) return false;
+    if (line.x1 > letterRight - pageW * 0.28) return false;
+    return true;
+  });
+  if (names.length < 4) return lines;
+  const marked = new Set(names);
+  const aside = names.map((line) => ({ ...line, role: "note" as const }));
+  return [...aside, ...lines.filter((line) => !marked.has(line))];
+}
+
 function versePage(lines: Line[]) {
   const body = lines.filter((line) => {
     if (line.plate || line.role === "note" || line.table) return false;
@@ -455,6 +538,7 @@ function versePage(lines: Line[]) {
   if (playPage(body)) return false;
   if (tightVerse(body)) return true;
   if (body.filter((line) => questionLine(line.text)).length >= 3) return false;
+  if (notePage(body)) return false;
   if (justifiedRun(body) >= 8) return false;
   const heights = body.map((line) => line.h).filter((h) => h > 0).sort((a, b) => a - b);
   const bodyH = heights[Math.floor(heights.length / 2)] || 12;
@@ -541,8 +625,9 @@ export function shapeLines(lines: Line[]): { lines: Line[]; note: string } {
     const pageLines = byPage.get(page) || [];
     const quiet = quietPicture(pageLines);
     if (quiet.dropped) pictures += 1;
-    const timetable = schedulePage(quiet.lines);
-    const split = timetable ? { body: quiet.lines, notes: [] as Line[] } : splitNotes(quiet.lines, bodyH);
+    const prepared = pullHyphenTail(liftMargin(quiet.lines));
+    const timetable = schedulePage(prepared);
+    const split = timetable ? { body: prepared, notes: [] as Line[] } : splitNotes(prepared, bodyH);
     const opened = timetable ? split.body : openGutter(split.body);
     const ordered = timetable ? opened : orderColumns(opened);
     if (ordered !== opened) columns += 1;

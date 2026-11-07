@@ -12,7 +12,8 @@ import { explainSaveFailure, formatBytes, OTHER_READER_BYTES, PICTURE_READER_BYT
 import { looksDoubtful, looksMangled, looksScrappy, needsPicture, pageNeedsPicture, scriptIn } from "./script.ts";
 import { applyPageReading, correctPageWords, keepDoubtPage } from "./review.ts";
 import { checkSameText, folioText, textFromReference } from "./check.ts";
-import { keepPageLanguage, mergeScriptLines, pageLooksMixed, readablePicture, untwinLine } from "./cases.ts";
+import { figurePage, keepPageLanguage, mergeScriptLines, pageLooksMixed, readablePicture, untwinLine } from "./cases.ts";
+import { keepDarkInk } from "./picture.ts";
 import { PRESS, pressUrl } from "./press.ts";
 import { dismissEntry, hideSample, listHoldings, listShelf, rememberOpened, splitStored, withoutOpened, SHELF_LIMIT, SAMPLES, type ShelfState } from "./shelf.ts";
 import { bookKey } from "./revise.ts";
@@ -125,6 +126,23 @@ describe("printed pages", () => {
     assert.equal(pages.label(6), 16);
     assert.equal(pages.label(7), 19);
     assert.equal(pages.label(12), 24);
+  });
+
+  it("starts the page numbers again when a later part begins at 1", () => {
+    const lines: Line[] = [];
+    for (let n = 1; n <= 6; n++) {
+      lines.push(line(String(n), n, 20));
+      lines.push(line("Body text of this page stays.", n, 400));
+    }
+    for (let n = 1; n <= 4; n++) {
+      lines.push(line(String(n), n + 6, 20));
+      lines.push(line("Body text of this page stays.", n + 6, 400));
+    }
+    const pages = detectPrinted(lines);
+    assert.equal(pages.label(1), 1);
+    assert.equal(pages.label(6), 6);
+    assert.equal(pages.label(7), 1);
+    assert.equal(pages.label(10), 4);
   });
 });
 
@@ -3080,6 +3098,84 @@ describe("verse and columns", () => {
     assert.equal(blocks.some((block) => /Left question 0/.test(textOf(block)) && /Left answer 0/.test(textOf(block))), false);
     assert.doesNotMatch(folio.warning || "", /verse/);
     assert.match(folio.warning || "", /column/);
+  });
+
+  it("sets a directors list aside and keeps a short note as prose", () => {
+    const page = { h: 12, pageW: 612, pageH: 792 };
+    const lines: Line[] = [];
+    for (const [name, y] of [
+      ["Ada Shore", 640],
+      ["Ben Holt", 622],
+      ["Cora Dale", 604],
+      ["Dan Ives", 586],
+      ["Eve Parr", 568],
+    ] as const) {
+      lines.push(line(name, 1, y, { ...page, x0: 36, x1: 130 }));
+    }
+    const prose = [
+      "Dear friends, the meeting will be held on the first Monday of the month.",
+      "Please bring the notes from the last gathering of the whole board.",
+      "We will read the letter and then turn to the business of the house.",
+      "The minutes of March were sent to every member before this meeting.",
+      "Kindly reply if you are unable to attend so that we may plan the room.",
+    ];
+    prose.forEach((text, index) => lines.push(line(text, 1, 660 - index * 28, { ...page, x0: 180, x1: 560 })));
+    const note = [
+      "Dear John,",
+      "The short note arrived this morning and the enclosed paper is fine.",
+      "I have read it twice and I will bring it with me on Thursday.",
+      "There is nothing further to add before we meet again next week.",
+      "Please keep the copy I sent and mark anything you would change.",
+      "I can call on Friday if a question remains after you have read it.",
+      "The other pages of this note are only a few lines each today.",
+      "Nothing in them should be read as a poem or as a list of titles.",
+      "Sincerely,",
+      "Washington-",
+      "Arrive at the hotel in the afternoon.",
+    ];
+    note.forEach((text, index) => lines.push(line(text, 2, 700 - index * 16, { ...page, x0: 72, x1: text.endsWith("-") ? 160 : 250 })));
+    const folio = assembleFolio(lines, { title: "Letter", subtitle: "", sourceName: "letter.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => ((block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    const letter = blocks.map(textOf).find((text) => /meeting will be held/.test(text)) || "";
+    assert.doesNotMatch(letter, /Ada Shore|Ben Holt|Cora Dale/);
+    assert.match(blocks.map(textOf).join(" "), /Ada Shore/);
+    assert.match(blocks.map(textOf).join(" "), /short note arrived[\s\S]*read it twice/);
+    assert.match(blocks.map(textOf).join(" "), /Washington- Arrive at the hotel/);
+    assert.doesNotMatch(folio.warning || "", /verse/);
+    const labels = ["Shame", "Guilt", "Apathy", "Grief", "Fear", "Desire", "Anger", "Pride"];
+    const scattered = labels.map((text, index) =>
+      line(text, 3, 500 - (index % 4) * 40, { ...page, x0: 40 + (index % 4) * 140, x1: 90 + (index % 4) * 140 }),
+    );
+    assert.equal(figurePage(scattered), true);
+    assert.equal(figurePage(prose.map((text, index) => line(text, 1, 600 - index * 20, { ...page, x0: 72, x1: 520 }))), false);
+  });
+
+  it("drops pale letters from the other side and keeps the dark ink", () => {
+    const width = 48;
+    const height = 24;
+    const rgba = new Uint8Array(width * height * 4);
+    rgba.fill(255);
+    const paint = (x: number, y: number, shade: number) => {
+      const at = (y * width + x) * 4;
+      rgba[at] = rgba[at + 1] = rgba[at + 2] = shade;
+    };
+    for (let y = 4; y < 12; y++) for (let x = 4; x < 10; x++) paint(x, y, 20);
+    for (let y = 4; y < 12; y++) for (let x = 30; x < 40; x++) paint(x, y, 170);
+    paint(10, 6, 160);
+    const faded = new Uint8Array(rgba);
+    faded.fill(245);
+    for (let y = 4; y < 12; y++) for (let x = 8; x < 20; x++) {
+      const at = (y * width + x) * 4;
+      faded[at] = faded[at + 1] = faded[at + 2] = 165;
+    }
+    assert.equal(keepDarkInk(faded, width, height), 0);
+    assert.equal(faded[(6 * width + 10) * 4], 165);
+    const dropped = keepDarkInk(rgba, width, height);
+    assert.ok(dropped > 20);
+    assert.equal(rgba[(6 * width + 6) * 4], 20);
+    assert.equal(rgba[(6 * width + 34) * 4], 255);
+    assert.equal(rgba[(6 * width + 10) * 4], 160);
   });
 });
 

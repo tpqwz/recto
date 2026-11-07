@@ -1,7 +1,7 @@
 import { strToU8, zipSync } from "fflate";
 import { detectPrinted, type PrintedPages } from "./pages.ts";
 import { confusableTwin, headingStep, mergeHyphen, readsEnglish, repairHeading, repairText, type WordList } from "./repair.ts";
-import { contributorOpen, entryOpen, labelOpen, noteOpen, questionLine, shapeLines, speechOpen, suppressTwins, untwinLine } from "./cases.ts";
+import { contributorOpen, entryOpen, labelOpen, noteOpen, questionLine, shapeLines, signOff, speechOpen, suppressTwins, untwinLine } from "./cases.ts";
 import { lineScript, otherScriptText } from "./script.ts";
 
 export type PageRun = { p: string };
@@ -3321,7 +3321,7 @@ export function assembleFolio(
       continue;
     }
     let prev: Line | undefined = buf[buf.length - 1];
-    if (prev && (speechOpen(ln.text) || questionLine(ln.text) || labelOpen(ln.text) || contributorOpen(ln.text) || entryOpen(ln.text) || /^\[/.test(ln.text.trim()))) {
+    if (prev && (speechOpen(ln.text) || questionLine(ln.text) || signOff(ln.text) || labelOpen(ln.text) || contributorOpen(ln.text) || entryOpen(ln.text) || /^\[/.test(ln.text.trim()))) {
       flush();
       prev = undefined;
     }
