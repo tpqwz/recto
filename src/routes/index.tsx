@@ -4,12 +4,15 @@ import { BookOpen, ChevronDown, Download, Menu, Search, Settings, X } from "luci
 import book from "@/data/book.json";
 import { previewPathPrefix } from "@/lib/preview-path-prefix";
 import { holdPreviewOpen } from "@/lib/preview-host-bridge";
-import { folioFromFile, runPage, type Block, type Folio, type Run, type TocNode } from "@/folio/from-pdf";
-import { republish } from "@/folio/assemble";
+import { folioFromFile, rereadPdfPage, runPage, type Block, type Folio, type Run, type TocNode } from "@/folio/from-pdf";
+import { republish, runText } from "@/folio/assemble";
+import { applyPageReading, correctPageWords, keepDoubtPage } from "@/folio/review";
+import { loadLexicon } from "@/folio/repair";
 import { PassageEditor, SelectionMenu, type SelectionPick } from "@/folio/editor";
 import { applyChapters, bookKey, loadBook, proseSpan, rememberRevision, saveBook, sourceOf, syncToc, type Revision } from "@/folio/revise";
 import { detectKind, dropOrphanSources, dropSource, keepSource, loadSource, originalLabel, type Retained } from "@/folio/source";
 import { explainSaveFailure, formatBytes, storageReport, until, type StorageReport } from "@/folio/storage";
+import { fetchPress, PRESS, pressUrl, type PressVolume, type PressWork } from "@/folio/press";
 import { dropScriptReader, storeScriptReader } from "@/folio/ocr-pp";
 import { armJob, cancelJob, cancelled, checkpoint, JobCancelled } from "@/folio/job";
 import { prefetchVision } from "@/folio/ocr-vision";
@@ -105,7 +108,7 @@ function owns(owners: Map<string, string>, chapterId: string, index: number, slo
 function textOf(block: Block) {
   if (block.s) return block.s;
   if (block.t === "table") return [...(block.headers || []), ...(block.rows || []).flat()].join(" ");
-  return (block.runs || []).filter((r): r is string => typeof r === "string").join(" ");
+  return (block.runs || []).map((run) => runText(run)).filter(Boolean).join(" ");
 }
 
 function sketchBook(book: Folio) {
@@ -178,6 +181,7 @@ function Desk() {
   const [pending, setPending] = useState<{ entry: ShelfEntry; step: 1 | 2 } | null>(null);
   const [wheel, setWheel] = useState(false);
   const [wheelChapter, setWheelChapter] = useState<string | null>(null);
+  const [reviewHidden, setReviewHidden] = useState(false);
   const chapters = chaptersOf(folio);
   const toc = tocOf(folio);
 
@@ -586,6 +590,31 @@ function Desk() {
     }
   }
 
+  async function openPress(work: PressWork, volume: PressVolume) {
+    begin(`Fetching ${work.title}, volume ${volume.volume}`);
+    armJob();
+    setNote("");
+    setLibraryOpen(false);
+    try {
+      const bytes = await fetchPress(pressUrl(work, volume), (got, total) => {
+        const whole = total ? ` of ${formatBytes(total)}` : "";
+        report(`Fetching volume ${volume.volume}${whole}. ${formatBytes(got)} so far.`);
+      });
+      if (cancelled()) throw new JobCancelled();
+      const file = new File([bytes], volume.file);
+      await takeBook(file, true, folio.epubHref);
+    } catch (err) {
+      if (err instanceof JobCancelled || cancelled()) {
+        report("Cancelled.");
+        setNote("Cancelled.");
+        return;
+      }
+      setNote(err instanceof Error ? err.message : "That volume could not be fetched.");
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function onBook(event: ChangeEvent<HTMLInputElement>) {
     const input = event.target;
     const files = Array.from(input.files || []);
@@ -635,15 +664,15 @@ function Desk() {
     setBusy("");
   }
 
-  async function takeBook(file: File, show: boolean, releaseHref?: string) {
+  async function takeBook(file: File, show: boolean, releaseHref?: string, settings = loadSettings(), fresh = false) {
     const bytes = await file.arrayBuffer();
-    const next = await folioFromFile(bytes.slice(0), file.name, report, loadSettings());
+    const next = await folioFromFile(bytes.slice(0), file.name, report, settings);
     const kind = next.origin?.kind || detectKind(file.name, new Uint8Array(bytes));
     next.origin = { name: file.name, kind };
     if (!next.title?.trim()) next.title = file.name.replace(/\.[^.]+$/, "") || "Untitled";
     let shelfNote = "";
     const saved = loadBook(bookKey(next));
-    const adopted = saved && Object.keys(saved.chapters).length ? republish(syncToc(applyChapters(next, saved.chapters))) : next;
+    const adopted = !fresh && saved && Object.keys(saved.chapters).length ? republish(syncToc(applyChapters(next, saved.chapters))) : next;
     const remember = (book: Folio, fileName?: string) => {
       if (isSampleBook(book)) return null;
       rememberFolio(bookKey(book), book);
@@ -677,7 +706,7 @@ function Desk() {
       setShelf(remembered);
       return remembered;
     };
-    const keepName = !isSampleBook(adopted) && loadSettings().keepFile ? file.name : undefined;
+    const keepName = !isSampleBook(adopted) && settings.keepFile ? file.name : undefined;
     const placed = isSampleBook(adopted) ? null : remember(adopted, keepName);
     if (show) {
       releaseEpub(releaseHref);
@@ -689,9 +718,11 @@ function Desk() {
       setSettingsOpen(false);
       setLibraryOpen(false);
       setOpen(true);
+      setReviewHidden(false);
     }
     if (!shelfNote) shelfNote = `${adopted.title} is on the shelf.`;
-    if (show) setNote([next.warning, shelfNote].filter(Boolean).join(" "));
+    const plainNote = adopted.plain ? "Words left as printed." : "";
+    if (show) setNote([next.warning, plainNote, shelfNote].filter(Boolean).join(" "));
     report(shelfNote);
     try {
       checkpoint();
@@ -703,7 +734,7 @@ function Desk() {
         void keepFolio(bookKey(adopted), adopted).catch(() => {});
       }
       const keptNote = keepName ? "Reading text kept, and the original file." : "Reading text kept.";
-      if (show) setNote([next.warning, keptNote].filter(Boolean).join(" "));
+      if (show) setNote([next.warning, plainNote, keptNote].filter(Boolean).join(" "));
       report(keptNote);
     } catch (err) {
       if (err instanceof JobCancelled) throw err;
@@ -732,6 +763,85 @@ function Desk() {
     return adopted.epubHref;
   }
 
+  async function applyCorrections() {
+    begin("Correcting the words");
+    armJob();
+    setNote("");
+    try {
+      const record = (await loadSource(bookKey(folio))) || source;
+      if (!record) {
+        setNote("The original file is not on this device. Turn corrections on in Settings and open the file again.");
+        setBusy("");
+        return;
+      }
+      const file = new File([record.bytes], record.name);
+      await takeBook(file, true, folio.epubHref, { ...loadSettings(), corrections: true }, true);
+    } catch (err) {
+      if (err instanceof JobCancelled) {
+        report("Cancelled.");
+        setNote("Cancelled.");
+        return;
+      }
+      setNote(err instanceof Error ? err.message : "The words could not be corrected.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function storeReviewed(next: Folio, message: string) {
+    const published = republish(next);
+    setFolio(published);
+    setNote(message);
+    if (isSampleBook(published)) return;
+    rememberFolio(bookKey(published), published);
+    await until(keepReadingCopy(bookKey(published), published), 20000).catch(() => {});
+    void keepFolio(bookKey(published), published).catch(() => {});
+  }
+
+  async function keepDoubt() {
+    const page = folio.doubt?.[0];
+    if (!page) return;
+    const left = (folio.doubt?.length || 1) - 1;
+    await storeReviewed(keepDoubtPage(folio, page.page), left ? `Page ${page.page} was kept.` : "The doubtful pages were kept or corrected.");
+  }
+
+  async function correctDoubt() {
+    const page = folio.doubt?.[0];
+    if (!page) return;
+    begin(`Correcting page ${page.page}`);
+    armJob();
+    setNote("");
+    try {
+      const record = (await loadSource(bookKey(folio))) || source;
+      if (record && (record.kind === "pdf" || /\.pdf$/i.test(record.name))) {
+        const text = await rereadPdfPage(record.bytes.slice(0), page.page, loadSettings(), report);
+        if (cancelled()) throw new JobCancelled();
+        await storeReviewed(applyPageReading(folio, page.page, text), `Page ${page.page} was read from its picture.`);
+        return;
+      }
+      const lexicon = await loadLexicon(previewPathPrefix(window.location.hostname, window.location.pathname) ?? "");
+      const next = lexicon ? correctPageWords(folio, page.page, lexicon) : null;
+      if (!next) {
+        setNote(
+          record
+            ? "That page could not be corrected."
+            : "The original file is not on this device, and the word list did not change that page.",
+        );
+        return;
+      }
+      await storeReviewed(next, `Page ${page.page} was corrected from the word list.`);
+    } catch (err) {
+      if (err instanceof JobCancelled) {
+        report("Cancelled.");
+        setNote("Cancelled.");
+        return;
+      }
+      setNote(err instanceof Error ? err.message : "That page could not be corrected.");
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function openKept(entry: ShelfEntry) {
     begin("Opening the book");
     armJob();
@@ -755,6 +865,7 @@ function Desk() {
       setLibraryOpen(false);
       setOpen(false);
       setSource(null);
+      setReviewHidden(false);
       const nextShelf = rememberRecent(loadShelf(), entryKey(entry));
       saveShelf(nextShelf);
       setShelf(nextShelf);
@@ -1235,6 +1346,7 @@ function Desk() {
             <LibrarySheet
               shelf={shelf}
               onOpen={(entry) => (entry.kind === "sample" && entry.sampleId ? openSample(entry.sampleId) : openKept(entry))}
+              onOpenPress={(work, volume) => void openPress(work, volume)}
               onRemove={(entry) => setPending({ entry, step: 1 })}
               onSave={(entry, record) => {
                 const next = storeRecord(loadShelf(), entry, record);
@@ -1274,6 +1386,14 @@ function Desk() {
                     : "Personal reading copy. Page numbers follow the file. The sample editions are in the contents rail."}
               </p>
               {folio.warning ? <p className="mt-2">{folio.warning}</p> : null}
+              {folio.plain ? (
+                <p className="mt-2">
+                  Words left as printed.{" "}
+                  <button type="button" className="underline" onClick={() => void applyCorrections()}>
+                    Correct the words
+                  </button>
+                </p>
+              ) : null}
             </footer>
           </article>
           )}
@@ -1292,6 +1412,28 @@ function Desk() {
           onShare={() => void sharePick()}
           onOriginal={folio.origin ? () => void openOriginal() : undefined}
         />
+      ) : null}
+      {!settingsOpen && !libraryOpen && !reviewHidden && folio.doubt?.[0] ? (
+        <div className="fixed inset-x-0 bottom-0 z-40 border-t border-rule bg-paper px-5 py-4 md:px-8">
+          <div className="mx-auto w-full max-w-2xl">
+            <p className="text-sm">
+              Page {folio.doubt[0].page}
+              {folio.doubt.length > 1 ? `, 1 of ${folio.doubt.length}` : ""}. This text looks broken. Keep it, or correct it.
+            </p>
+            <p className="mt-2 max-h-24 overflow-y-auto text-sm leading-relaxed text-muted">{folio.doubt[0].sample}</p>
+            <div className="mt-3 flex gap-2">
+              <button type="button" className="h-11 rounded-ui border border-rule px-3 text-sm" onClick={() => void keepDoubt()}>
+                Keep
+              </button>
+              <button type="button" className="h-11 rounded-ui border border-cinnabar px-3 text-sm" onClick={() => void correctDoubt()} disabled={!!busy}>
+                Correct
+              </button>
+              <button type="button" className="h-11 px-3 text-sm text-muted" onClick={() => setReviewHidden(true)}>
+                Not now
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
       {logOpen ? (
         <div className="fixed inset-x-0 bottom-0 z-50 flex h-[min(50dvh,32rem)] flex-col border-t border-desk-line bg-desk text-desk-fg">
@@ -1360,6 +1502,7 @@ function Desk() {
 function LibrarySheet({
   shelf,
   onOpen,
+  onOpenPress,
   onRemove,
   onSave,
   onDiscardFile,
@@ -1367,6 +1510,7 @@ function LibrarySheet({
 }: {
   shelf: ShelfState;
   onOpen: (entry: ShelfEntry) => void;
+  onOpenPress: (work: PressWork, volume: PressVolume) => void;
   onRemove: (entry: ShelfEntry) => void;
   onSave: (entry: ShelfEntry, record: CatalogRecord) => void;
   onDiscardFile: (entry: ShelfEntry) => Promise<void>;
@@ -1522,6 +1666,34 @@ function LibrarySheet({
           className="h-11 rounded-ui border border-rule bg-paper-2 px-3 text-sm text-ink outline-none"
         />
       </label>
+      <section className="mt-8 max-w-3xl border-t border-rule pt-6">
+        <h2 className="font-serif text-xl">Public domain</h2>
+        <p className="mt-2 text-sm leading-relaxed text-muted">
+          The full encyclopedias, not an excerpt. A volume is fetched when you open it, and it is not kept here until then.
+        </p>
+        {PRESS.map((work) => (
+          <div key={work.id} className="mt-5">
+            <h3 className="font-serif text-lg">{work.title}</h3>
+            <p className="mt-1 text-sm leading-relaxed text-muted">
+              {work.rights} {work.volumes.length} volumes.
+            </p>
+            <ul className="mt-3 flex flex-wrap gap-2">
+              {work.volumes.map((volume) => (
+                <li key={volume.id}>
+                  <button
+                    type="button"
+                    className="h-11 rounded-ui border border-rule px-3 text-left text-sm"
+                    onClick={() => onOpenPress(work, volume)}
+                  >
+                    {volume.volume}. {volume.label}
+                    {volume.bytes ? <span className="text-muted"> · {formatBytes(volume.bytes)}</span> : null}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </section>
       <div className="mt-4 overflow-x-auto border-t border-rule">
         <table className="w-full min-w-[52rem] border-collapse text-left">
           <thead>
@@ -1784,8 +1956,42 @@ function SettingsSheet({
           <Choice
             on={settings.keepFile}
             label="Keep the original file"
-            hint="Stores the file in this browser so a page can be opened beside the text. This is what fills the site’s storage."
+            hint="Stores the file in this browser so a page can be opened beside the text, and so the words can be corrected afterwards. This is what fills the site’s storage."
             onPick={() => onChange({ ...settings, keepFile: true })}
+          />
+        </div>
+      </fieldset>
+      <fieldset className="mt-8">
+        <legend className="text-sm font-medium">Words</legend>
+        <div className="mt-3 grid gap-2">
+          <Choice
+            on={!settings.corrections}
+            label="As printed"
+            hint="The text layer is converted into chapters. The words stay as printed, including a word split at the end of a line. This is how a book opens."
+            onPick={() => onChange({ ...settings, corrections: false })}
+          />
+          <Choice
+            on={settings.corrections}
+            label="Correct the words"
+            hint="The next time a book is opened, a word list repairs a letter a scan confused and a word split at the end of a line. A short name is left alone."
+            onPick={() => onChange({ ...settings, corrections: true })}
+          />
+        </div>
+      </fieldset>
+      <fieldset className="mt-8">
+        <legend className="text-sm font-medium">Doubtful pages</legend>
+        <div className="mt-3 grid gap-2">
+          <Choice
+            on={!settings.review}
+            label="Leave them"
+            hint="A page is kept as it was read. This is how a book opens."
+            onPick={() => onChange({ ...settings, review: false })}
+          />
+          <Choice
+            on={settings.review}
+            label="Ask"
+            hint="When a page's letters look broken, you are shown that page and asked whether to keep the text or correct it. Correct reads the picture when the original file is still on this device, and otherwise tries the word list."
+            onPick={() => onChange({ ...settings, review: true })}
           />
         </div>
       </fieldset>
@@ -1961,7 +2167,29 @@ function BlockView({
       </>
     );
   }
+  if (block.t === "img" && block.img && block.img.startsWith("data:image/")) {
+    const width = block.w && block.w > 0 ? Math.round(block.w) : undefined;
+    return (
+      <figure className="my-4" {...place}>
+        {lead && block.page ? <PageMark page={block.page} /> : null}
+        <img
+          src={block.img}
+          alt="Picture"
+          className="h-auto max-w-full"
+          style={width ? { width, maxWidth: "100%" } : undefined}
+        />
+      </figure>
+    );
+  }
   if (block.t === "toc-entry") {
+    const label = block.n ? `${block.n}. ${block.s}` : block.s;
+    if (!block.id || block.kind === "part") {
+      return (
+        <p className={"tocline py-2 " + (block.kind === "part" ? "mt-4 text-sm" : "pl-4 text-sm text-muted")} {...place}>
+          {label}
+        </p>
+      );
+    }
     return (
       <p className="tocline" {...place}>
         <a
@@ -1971,7 +2199,7 @@ function BlockView({
             (block.kind === "section" ? " pl-6" : "")
           }
         >
-          <span>{block.n ? `${block.n}. ${block.s}` : block.s}</span>
+          <span>{label}</span>
           <span className="text-muted tabular-nums">{block.page}</span>
         </a>
       </p>
@@ -2023,7 +2251,32 @@ function BlockView({
               </span>
             ) : null;
           }
-          if (typeof run !== "string") return null;
+          if (typeof run !== "string") {
+            if (!run || typeof run !== "object" || !("a" in run) || !("href" in run)) return null;
+            const href = run.href;
+            const external = /^https?:\/\//i.test(href) || href.startsWith("mailto:");
+            const prev = runIndex > 0 ? runPage((block.runs as Run[])[runIndex - 1]) : null;
+            const gap = prev != null && /^[A-Za-z0-9]/.test(run.a) ? " " : "";
+            return (
+              <a
+                key={runIndex}
+                href={external ? href : `#src-${href.slice(6)}`}
+                target={external ? "_blank" : undefined}
+                rel={external ? "noreferrer" : undefined}
+                className="text-[#5b3a86] underline underline-offset-2"
+                onClick={(event) => {
+                  if (external || !href.startsWith("folio:")) return;
+                  const host = document.querySelector(`[data-src="${href.slice(6)}"]`);
+                  if (!host) return;
+                  event.preventDefault();
+                  host.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+              >
+                {gap}
+                {run.a}
+              </a>
+            );
+          }
           const prev = runIndex > 0 ? runPage((block.runs as Run[])[runIndex - 1]) : null;
           const gap = prev != null && /^[A-Za-z0-9]/.test(run) ? " " : "";
           return (

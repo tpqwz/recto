@@ -9,6 +9,8 @@ export type ComposeOptions = {
   outline?: OutlineItem[];
   emptyMessage: string;
   lexiconPrefix: string;
+  /** Off leaves every word as the text layer printed it. */
+  corrections?: boolean;
   cover?: string;
   onStatus?: (status: string) => void;
 };
@@ -79,13 +81,14 @@ export function composeFolio(lines: Line[], options: ComposeOptions): Promise<Fo
       outline: options.outline,
       emptyMessage: options.emptyMessage,
       lexiconPrefix: options.lexiconPrefix,
+      corrections: options.corrections === true,
       cover: options.cover,
     });
   });
 }
 
 async function onThisThread(lines: Line[], options: ComposeOptions): Promise<Folio> {
-  const lexicon = await loadLexicon(options.lexiconPrefix);
+  const lexicon = options.corrections ? await loadLexicon(options.lexiconPrefix) : null;
   const folio = assembleFolio(lines, { ...options, lexicon, skipEpub: true });
   options.onStatus?.("Making the EPUB");
   const bytes = epubArchive(folio, options.sourceName);

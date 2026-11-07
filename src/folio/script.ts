@@ -135,3 +135,11 @@ export function needsPicture(text: string) {
   const odd = tokens.filter((token) => !/^[\p{Script=Latin}\d][\p{Script=Latin}\d'’.,:;!?()-]*$/u.test(token));
   return odd.length >= 5 && odd.length / tokens.length >= 0.18;
 }
+
+/** A page long enough to judge, whose letters do not read as a language. A short title is not doubtful. */
+export function looksDoubtful(text: string) {
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  if (trimmed.length < 40) return false;
+  if (looksMangled(trimmed)) return true;
+  return needsPicture(trimmed);
+}

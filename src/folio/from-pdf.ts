@@ -2,11 +2,13 @@ import type { PDFDocumentProxy } from "pdfjs-dist/types/src/display/api";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { previewPathPrefix } from "@/lib/preview-path-prefix";
 import { cluster, runPage, type Folio, type Line, type OutlineItem } from "./assemble";
+import { paintLinks, safeHref, type Glyph, type LinkBox } from "./links";
+import { contentPlates, imagePlacements, imagesInPdf } from "./plates";
 import { composeFolio } from "./compose";
 import { pictureScale } from "./picture";
 import { loadVision } from "./ocr-vision";
 import { readPicturePages } from "./pictures";
-import { looksMangled, needsPicture, scriptIn, scriptLabel } from "./script";
+import { looksDoubtful, looksMangled, needsPicture, scriptIn, scriptLabel } from "./script";
 import { jpegFromRgba } from "./cover";
 import { loadPdfjs, pdfAssetOptions } from "./pdf-local";
 import { checkpoint } from "./job";
@@ -95,7 +97,9 @@ export async function folioFromPdf(
   onStatus?.("Opening the PDF");
   const pdfjs = await loadPdfjs();
   pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
-  const doc = await pdfjs.getDocument({ data: new Uint8Array(data), ...pdfAssetOptions() }).promise;
+  const bytes = new Uint8Array(data);
+  const storedImages = imagesInPdf(bytes);
+  const doc = await pdfjs.getDocument({ data: bytes, ...pdfAssetOptions() }).promise;
   onStatus?.(`${doc.numPages} ${doc.numPages === 1 ? "page" : "pages"}`);
   if (settings.kind === "vision" && settings.pictures !== "off") {
     onStatus?.("Starting the vision model");
@@ -104,8 +108,11 @@ export async function folioFromPdf(
     });
   }
   const lines: Line[] = [];
+  const uses: ReturnType<typeof imagePlacements> = [];
+  let linkCount = 0;
   const empty: number[] = [];
   const mangledPages = new Set<number>();
+  const doubt: { page: number; sample: string }[] = [];
   const size = new Map<number, { w: number; h: number }>();
   try {
     for (let n = 1; n <= doc.numPages; n++) {
@@ -114,9 +121,39 @@ export async function folioFromPdf(
     const view = page.getViewport({ scale: 1 });
     size.set(n, { w: view.width, h: view.height });
     const content = await page.getTextContent();
-    const clustered = cluster(content.items as { str: string; transform: number[]; width?: number; height?: number }[]);
+    const glyphs = (content.items as Glyph[]).filter((item) => item && item.str);
+    let boxes: LinkBox[] = [];
+    try {
+      const notes = await page.getAnnotations();
+      for (const note of notes) {
+        if (note.subtype !== "Link" || !Array.isArray(note.rect)) continue;
+        const [a, b, c, d] = note.rect as number[];
+        let href = safeHref(String(note.url || note.unsafeUrl || ""));
+        if (!href && note.dest) {
+          const destPage = await pageOfDest(doc, note.dest);
+          if (destPage) href = `folio:${destPage}`;
+        }
+        if (!href) continue;
+        boxes.push({ x0: Math.min(a, c), y0: Math.min(b, d), x1: Math.max(a, c), y1: Math.max(b, d), href });
+      }
+    } catch {
+      boxes = [];
+    }
+    linkCount += boxes.length;
+    try {
+      const ops = await page.getOperatorList();
+      uses.push(...imagePlacements(ops.fnArray, ops.argsArray, pdfjs.OPS, n, view.height));
+    } catch {
+      /* a page whose pictures cannot be listed still keeps its text */
+    }
+    const clustered = cluster(paintLinks(glyphs, boxes));
     page.cleanup();
     const text = clustered.map((line) => line.text).join(" ");
+    const ask = settings.review && looksDoubtful(text);
+    if (ask) {
+      doubt.push({ page: n, sample: text.replace(/\s+/g, " ").trim().slice(0, 320) });
+      for (const ln of clustered) lines.push({ ...ln, page: n, pageH: view.height, pageW: view.width });
+    } else {
     const mangled = settings.pictures === "empty" && settings.scripts.some((id) => id !== "en") && looksMangled(text);
     if (mangled) {
       mangledPages.add(n);
@@ -124,8 +161,9 @@ export async function folioFromPdf(
       for (const ln of clustered) lines.push({ ...ln, page: n, pageH: view.height, pageW: view.width });
     } else if (!clustered.length || needsPicture(text)) empty.push(n);
     else for (const ln of clustered) lines.push({ ...ln, page: n, pageH: view.height, pageW: view.width });
+    }
     await breathe();
-  }
+    }
   let warning: string | undefined;
   if (empty.length) {
     const blanks = empty.length - mangledPages.size;
@@ -224,6 +262,24 @@ export async function folioFromPdf(
   const outline = await readOutline(doc, doc.numPages);
   const listed = outline.filter((item) => item.page || item.children.some((child) => child.page)).length;
   onStatus?.(listed >= 2 ? `The file lists ${listed} chapters` : "The file has no contents list");
+  const plates = contentPlates(uses, storedImages, doc.numPages);
+  for (const plate of plates) {
+    const box = size.get(plate.page) || { w: 612, h: 792 };
+    lines.push({
+      text: " ",
+      y: plate.y + plate.h,
+      x0: plate.x,
+      x1: plate.x + plate.w,
+      h: Math.max(plate.h, 1),
+      page: plate.page,
+      pageH: box.h,
+      pageW: box.w,
+      plate: { data: plate.url, w: plate.w, h: plate.h },
+    });
+  }
+  if (plates.length || linkCount) lines.sort((a, b) => a.page - b.page || b.y - a.y || a.x0 - b.x0);
+  if (linkCount) onStatus?.("The links were kept");
+  if (plates.length) onStatus?.(`Kept ${plates.length} ${plates.length === 1 ? "picture" : "pictures"}`);
   checkpoint();
   const folio = await composeFolio(lines, {
     title,
@@ -232,6 +288,7 @@ export async function folioFromPdf(
     sourceName: filename,
     outline,
     lexiconPrefix: assetPrefix(),
+    corrections: settings.corrections === true,
     cover,
     emptyMessage:
       settings.pictures === "empty" && empty.length
@@ -240,12 +297,61 @@ export async function folioFromPdf(
     onStatus,
   });
   folio.warning = [folio.warning, warning].filter(Boolean).join(" ") || undefined;
+  if (!settings.corrections) folio.plain = true;
+  if (doubt.length) folio.doubt = doubt;
   folio.origin = { name: filename, kind: "pdf" };
     return folio;
   } catch (err) {
     const closer = doc as unknown as { destroy?: () => Promise<void> };
     void closer.destroy?.().catch(() => {});
     throw err;
+  }
+}
+
+/** Read one page from its picture. Used when a doubtful page is corrected. */
+export async function rereadPdfPage(
+  data: ArrayBuffer,
+  pageNumber: number,
+  settings: DeskSettings = DEFAULT_SETTINGS,
+  onStatus?: (s: string) => void,
+): Promise<string> {
+  const pdfjs = await loadPdfjs();
+  pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(data), ...pdfAssetOptions() }).promise;
+  try {
+    const page = await doc.getPage(pageNumber);
+    const view = page.getViewport({ scale: 1 });
+    const read = await readPicturePages(
+      [
+        {
+          n: pageNumber,
+          pageW: view.width,
+          pageH: view.height,
+          draw: async () => {
+            const scale = pictureScale(view.width, view.height);
+            const viewport = page.getViewport({ scale });
+            const canvas = document.createElement("canvas");
+            canvas.width = Math.ceil(viewport.width);
+            canvas.height = Math.ceil(viewport.height);
+            const ctx = canvas.getContext("2d");
+            if (!ctx) throw new Error("Could not draw that page.");
+            await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+            return canvas;
+          },
+        },
+      ],
+      doc.numPages,
+      settings.kind,
+      onStatus,
+      "en",
+      settings.scripts,
+    );
+    const text = read.lines.map((line) => line.text).join("\n").replace(/[ \t]+\n/g, "\n").trim();
+    if (!text) throw new Error(read.warning || "No text could be read from the picture of that page.");
+    return text;
+  } finally {
+    const closer = doc as unknown as { destroy?: () => Promise<void> };
+    void closer.destroy?.().catch(() => {});
   }
 }
 

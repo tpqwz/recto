@@ -2,14 +2,18 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { detectPrinted } from "./pages.ts";
 import { headingStep, mergeHyphen, repairHeading, repairText, type WordList } from "./repair.ts";
-import { assembleFolio, cluster, contentsEntry, epubArchive, type Line } from "./assemble.ts";
-import { strToU8, unzipSync, zipSync } from "fflate";
+import { assembleFolio, cluster, contentsEntry, epubArchive, runText, type Line } from "./assemble.ts";
+import { paintLinks, safeHref } from "./links.ts";
+import { contentPlates, imagesInPdf, type ImageUse, type PdfImage } from "./plates.ts";
+import { strToU8, unzipSync, zipSync, zlibSync } from "fflate";
 import { linesFromBoxes, linesFromRegion, pictureScale } from "./picture.ts";
 import { parseSettings } from "./settings.ts";
 import { explainSaveFailure, formatBytes, OTHER_READER_BYTES, PICTURE_READER_BYTES, type StorageReport } from "./storage.ts";
-import { looksMangled, looksScrappy, needsPicture, pageNeedsPicture, scriptIn } from "./script.ts";
+import { looksDoubtful, looksMangled, looksScrappy, needsPicture, pageNeedsPicture, scriptIn } from "./script.ts";
+import { applyPageReading, correctPageWords, keepDoubtPage } from "./review.ts";
 import { checkSameText, folioText, textFromReference } from "./check.ts";
 import { keepPageLanguage, mergeScriptLines, pageLooksMixed, readablePicture, untwinLine } from "./cases.ts";
+import { PRESS, pressUrl } from "./press.ts";
 import { dismissEntry, hideSample, listHoldings, listShelf, rememberOpened, splitStored, withoutOpened, SHELF_LIMIT, SAMPLES, type ShelfState } from "./shelf.ts";
 import { bookKey } from "./revise.ts";
 import { catalogFromOpened, recordFor, sortRecords, storeRecord } from "./library.ts";
@@ -65,6 +69,19 @@ describe("printed pages", () => {
     assert.equal(pages.label(3), "iii");
     assert.equal(pages.label(4), 1);
     assert.equal(pages.label(6), 3);
+  });
+
+  it("reads a folio number set between dashes", () => {
+    const lines: Line[] = [];
+    for (let n = 1; n <= 6; n++) {
+      lines.push(line("THE B-3 THERAPY", n + 1, 760));
+      lines.push(line(`- ${n} -`, n + 1, 24));
+      lines.push(line("Body text of this page stays.", n + 1, 400));
+    }
+    const pages = detectPrinted(lines);
+    assert.equal(pages.label(1), null);
+    assert.equal(pages.label(2), 1);
+    assert.equal(pages.label(7), 6);
   });
 
   it("does not number a trailing page after the last printed folio", () => {
@@ -1302,6 +1319,8 @@ describe("desk settings", () => {
       kind: "pp",
       keepFile: false,
       scripts: ["en"],
+      corrections: false,
+      review: false,
     });
   });
 });
@@ -1418,6 +1437,35 @@ describe("shelf", () => {
       "asc",
     );
     assert.equal(ordered[0]?.record.volume, "Volume I");
+  });
+});
+
+describe("public domain encyclopedias", () => {
+  const files = [
+    "Encyclopedia_Britannica_01_A_-_Androphagi.djvu",
+    "Encyclopedia_Britannica_03_Austria_lower_-_Bisectrix.djvu",
+    "Encyclopedia_Britannica_10_Evangelical_church_conference_-_Francis_Joseph_I.djvu",
+    "Encyclopedia_Britannica_17_Lord_Chamberlain_-_Mecklenburg.djvu",
+    "Encyclopedia_Britannica_24_Sainte-Claire_Deville_-_Shuttle.djvu",
+    "Encyclopedia_Britannica_29_Index_-_List_of_contributors.djvu",
+  ];
+
+  it("lists every volume of the eleventh Britannica and the New International", () => {
+    const britannica = PRESS.find((work) => work.id === "britannica-11");
+    const international = PRESS.find((work) => work.id === "new-international");
+    assert.equal(britannica?.volumes.length, 29);
+    assert.equal(international?.volumes.length, 17);
+    assert.equal(britannica?.volumes[0]?.label, "A–Androphagi");
+    assert.equal(britannica?.volumes[28]?.label, "Index–List of contributors");
+    assert.equal(new Set(PRESS.flatMap((work) => work.volumes.map((volume) => volume.id))).size, 46);
+    for (const name of files) assert.equal(britannica?.volumes.some((volume) => volume.file === name), true);
+    const first = britannica!.volumes[0];
+    assert.equal(
+      pressUrl(britannica!, first),
+      "https://cors.archive.org/cors/EncyclopaediaBritannica1911HQDJVU/Encyclopedia_Britannica_01_A_-_Androphagi.djvu",
+    );
+    const lastNie = international!.volumes[16];
+    assert.equal(pressUrl(international!, lastNie), "https://cors.archive.org/cors/newinternationa17gilm/newinternationa17gilm.pdf");
   });
 });
 
@@ -1618,7 +1666,7 @@ describe("interlinear pages", () => {
   });
 
   it("repairs the chapter mark on the opening and dresses a heading the body confirms", () => {
-    const words = new Set("rabbit sends little bill queen croquet ground advice caterpillar stole tarts mock turtle story alice evidence and the who from".split(" "));
+    const words = new Set("rabbit sends little bill queen croquet ground advice caterpillar stole tarts mock turtle story alice evidence and the who from cool fountains".split(" "));
     const lines: Line[] = [line("Contents", 1, 720)];
     const rows: [string, number, string, string][] = [
       ["IV. The Rabbit Sends in a Little Bill .......... 3", 3, "CHAPTER lY.", "THE RABBIT SENDS IN A LITTLE BILL."],
@@ -1912,4 +1960,1127 @@ describe("interlinear pages", () => {
     assert.match((second?.blocks || []).flatMap((block) => block.runs || []).join(" "), /second stave stays/);
   });
 });
+
+describe("doubtful pages", () => {
+  const folio = {
+    title: "Body",
+    subtitle: "",
+    author: "",
+    stats: { hyphensRejoined: 0, headersRemoved: 0, chapters: 1 },
+    toc: [],
+    chapters: [
+      {
+        id: "c01",
+        title: "Chapter",
+        page: 1,
+        blocks: [
+          { t: "p", src: 2, runs: ["The page before stays."] },
+          { t: "p", src: 3, runs: ["x7 ## q q q !! 1l"] },
+          { t: "p", src: 4, runs: ["The page after stays."] },
+        ],
+      },
+    ],
+    doubt: [
+      { page: 3, sample: "x7" },
+      { page: 9, sample: "later" },
+    ],
+  };
+
+  it("replaces one doubtful page and leaves the others", () => {
+    const next = applyPageReading(folio, 3, "The corrected page stays here.");
+    const text = next.chapters[0].blocks.flatMap((block) => block.runs || []).join(" ");
+    assert.match(text, /corrected page/);
+    assert.equal(text.includes("1l"), false);
+    assert.match(text, /page before/);
+    assert.match(text, /page after/);
+    assert.deepEqual(next.doubt, [{ page: 9, sample: "later" }]);
+    assert.equal(keepDoubtPage(next, 9).doubt, undefined);
+  });
+
+  it("leaves a short title and a real sentence, and flags a broken page", () => {
+    assert.equal(looksDoubtful("Chapter I"), false);
+    assert.equal(looksDoubtful("The mind is the forerunner of all things and it stays a sentence."), false);
+    assert.equal(looksDoubtful(`${"x7 ## q q q !! 1l 1l ".repeat(6)}broken page`), true);
+    const list = { has: (word: string) => word === "the" || word === "page" || word === "stays" };
+    const quiet = {
+      ...folio,
+      chapters: [{ ...folio.chapters[0], blocks: [{ t: "p", src: 3, runs: ["The page stays."] }] }],
+    };
+    assert.equal(correctPageWords(quiet, 3, list), null);
+  });
+});
+
+describe("plain reading", () => {
+  it("leaves a split word until a word list is used", () => {
+    const lines: Line[] = [line("The con-", 1, 640), line("scious mind stays.", 1, 620)];
+    const plain = assembleFolio(lines, { title: "Plain", subtitle: "", sourceName: "plain.pdf", emptyMessage: "empty", skipEpub: true });
+    const plainText = plain.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).filter((run) => typeof run === "string").join(" ");
+    assert.match(plainText, /con-/);
+    assert.equal(plain.stats.hyphensRejoined, 0);
+    const fixed = assembleFolio(lines, {
+      title: "Plain",
+      subtitle: "",
+      sourceName: "plain.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      lexicon: { has: (word) => word === "conscious" || word === "mind" || word === "stays" },
+    });
+    const fixedText = fixed.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).filter((run) => typeof run === "string").join(" ");
+    assert.match(fixedText, /conscious/);
+    assert.equal(fixed.stats.hyphensRejoined, 1);
+  });
+
+  it("follows the body when a contents list does not open the chapters", () => {
+    const lines: Line[] = [];
+    for (let n = 1; n <= 4; n++) {
+      const page = 10 + n;
+      lines.push(line(`CHAPTER ${["I", "II", "III", "IV"][n - 1]}`, page, 700, { h: 16, x0: 250, x1: 370 }));
+      lines.push(line(`The body of chapter ${n} stays on its own page here.`, page, 640));
+    }
+    const folio = assembleFolio(lines, {
+      title: "Body",
+      subtitle: "",
+      sourceName: "body.pdf",
+      emptyMessage: "empty",
+      skipEpub: true,
+      outline: [1, 2, 3, 4].map((n) => ({ label: `Chapter ${n} - Missing`, page: 1, children: [] })),
+    });
+    const text = (title: RegExp) =>
+      (folio.chapters.find((chapter) => title.test(chapter.title))?.blocks || [])
+        .flatMap((block) => block.runs || [])
+        .filter((run) => typeof run === "string")
+        .join(" ");
+    assert.match(text(/^Chapter I\b/), /chapter 1 stays/);
+    assert.doesNotMatch(text(/^Chapter I\b/), /chapter 2 stays/);
+    assert.equal(folio.chapters.some((chapter) => /Missing/.test(chapter.title)), false);
+  });
+
+  it("keeps an interior heading inside a lecture", () => {
+    const lines: Line[] = [];
+    for (const [n, roman, page] of [
+      ["1", "I", 3],
+      ["2", "II", 5],
+      ["3", "III", 7],
+    ] as const) {
+      lines.push(line(String(page), page, 20));
+      lines.push(line(`LECTURE ${roman}`, page, 700, { h: 18, x0: 250, x1: 370 }));
+      lines.push(line(`THE SUBJECT OF LECTURE ${n}`, page, 670, { h: 14, x0: 150, x1: 470 }));
+      lines.push(line(`The body of lecture ${n} stays on its own page here.`, page, 600));
+      lines.push(line("THE INNER HEADING", page, 540, { h: 20, x0: 200, x1: 420 }));
+      lines.push(line(`The inner heading of lecture ${n} stays in the lecture.`, page, 500));
+    }
+    const folio = assembleFolio(lines, { title: "Lectures", subtitle: "", sourceName: "lectures.pdf", emptyMessage: "empty", skipEpub: true });
+    const titles = folio.chapters.map((chapter) => chapter.title);
+    assert.equal(titles.some((title) => /inner heading/i.test(title)), false);
+    assert.ok(titles.some((title) => /^Lecture I\b/.test(title)), titles.join(" | "));
+    assert.ok(titles.some((title) => /^Lecture II\b/.test(title)), titles.join(" | "));
+    assert.ok(titles.some((title) => /^Lecture III\b/.test(title)), titles.join(" | "));
+    const text = (title: RegExp) =>
+      (folio.chapters.find((chapter) => title.test(chapter.title))?.blocks || [])
+        .flatMap((block) => block.runs || [])
+        .filter((run) => typeof run === "string")
+        .join(" ");
+    assert.match(text(/^Lecture I\b/), /inner heading of lecture 1/);
+    assert.doesNotMatch(text(/^Lecture I\b/), /lecture 2 stays/);
+  });
+
+  it("reads a numbered contents list that has no page numbers", () => {
+    const lines: Line[] = [line("Contents", 2, 740)];
+    const titles = [
+      "Implications of a Catholic Practice",
+      "Theological Premises for the Person",
+      "Christian Advantages for Practice",
+      "Modern Personality Theories Today",
+      "Basic Psychological Support Today",
+      "Integrated Laminate of the Person",
+      "Methodology and Presuppositions Today",
+      "Personal Wholeness and Unity Today",
+    ];
+    lines.push(line("Part I. The Opening", 2, 720));
+    titles.forEach((title, index) => {
+      lines.push(line(`${index + 1}. ${title}`, 2, 700 - index * 18));
+    });
+    lines.push(line("Chapter 2 - Theological Premises for the Person", 6, 700, { h: 18, x0: 80, x1: 520 }));
+    lines.push(line("The body of the second chapter stays here in full.", 6, 640));
+    for (let n = 0; n < 12; n++) lines.push(line("of our skills allowing us to recognize other", 8, 700 - n * 16));
+    const folio = assembleFolio(lines, { title: "Meta", subtitle: "", sourceName: "meta.pdf", emptyMessage: "empty", skipEpub: true });
+    const shown = (folio.chapters.find((chapter) => chapter.id === "contents")?.blocks || [])
+      .filter((block) => block.t === "toc-entry")
+      .map((block) => block.s || "");
+    assert.ok(shown.some((label) => label.startsWith("1. Implications")), shown.join(" | "));
+    assert.ok(shown.some((label) => /Part I/.test(label)), shown.join(" | "));
+    assert.equal(folio.chapters.some((chapter) => /of our skills/.test(chapter.title)), false);
+    const linked = folio.chapters.find((chapter) => chapter.id === "contents")?.blocks.find((block) => /Theological Premises/.test(block.s || ""));
+    assert.ok(linked?.id, shown.join(" | "));
+    const host = folio.chapters.find((chapter) => chapter.id === linked?.id);
+    assert.match((host?.blocks || []).flatMap((block) => block.runs || []).join(" "), /second chapter stays/);
+  });
+
+  it("keeps a wrapped contents author and does not link an excerpt", () => {
+    const lines: Line[] = [line("Contents", 2, 740, { x0: 60 })];
+    lines.push(line("Part I. The Opening", 2, 720, { x0: 60 }));
+    lines.push(line("1. Implications of a Catholic Christian Meta-Model of the Person for Mental Health Practice: Orientation and", 2, 700, { x0: 60, x1: 520 }));
+    lines.push(line("Introductory Comments. W. J. Nordling, P. C. Vitz, C. S. Titus, & the DMU Group", 2, 682, { x0: 99, x1: 460 }));
+    lines.push(line("2. Theological, Philosophical, and Psychological Premises for a Catholic Christian Meta-Model of the Person.", 2, 660, { x0: 60, x1: 520 }));
+    lines.push(line("C. S. Titus, P. C. Vitz, W. J. Nordling, & the DMU Group", 2, 642, { x0: 96, x1: 420 }));
+    lines.push(line("3. Man and Woman", 2, 620, { x0: 60, x1: 200 }));
+    lines.push(line("C. Gross, L. Klewicki, P. C. Vitz, & C. S. Titus", 2, 602, { x0: 98, x1: 360 }));
+    lines.push(line("4. Ful illed through Vocation. C. S. Titus", 2, 580, { x0: 60, x1: 400 }));
+    for (let n = 5; n <= 8; n++) lines.push(line(`${n}. A Later Chapter About Practice`, 2, 560 - n * 16, { x0: 60, x1: 360 }));
+    lines.push(line("The following text identifies four ways that the Catholic Christian Meta-Model of the Person", 5, 700));
+    lines.push(line("(Excerpt from Chapter 1)", 5, 670));
+    lines.push(line("The Psychological Premises of the Person are III. The person, with the help of others,", 4, 700));
+    lines.push(line("consistent with the Theological and Philosophical premises of the model.", 4, 680));
+    lines.push(line("Psychological Premises of the Person", 6, 700, { h: 16, x0: 80, x1: 480 }));
+    lines.push(line("(Excerpt from Chapter 2)", 6, 670));
+    lines.push(line("Chapter 2 - Theological, Philosophical, and Psychological Premises", 9, 700, { h: 18, x0: 80, x1: 540 }));
+    lines.push(line("The body of the second chapter stays here in full.", 9, 640));
+    for (let n = 0; n < 12; n++) lines.push(line("of our skills allowing us to recognize other", 8, 700 - n * 16));
+    const folio = assembleFolio(lines, { title: "Meta", subtitle: "", sourceName: "meta.pdf", emptyMessage: "empty", skipEpub: true });
+    const entries = (folio.chapters.find((chapter) => chapter.id === "contents")?.blocks || []).filter((block) => block.t === "toc-entry");
+    const label = (start: RegExp) => entries.find((block) => start.test(block.s || ""));
+    const first = label(/^1\. /);
+    const second = label(/^2\. /);
+    const third = label(/^3\. /);
+    assert.match(first?.s || "", /DMU Group$/);
+    assert.equal(first?.id, undefined);
+    assert.match(second?.s || "", /DMU Group$/);
+    assert.match(third?.s || "", /C\. Gross/);
+    assert.match(label(/^4\. /)?.s || "", /Fulfilled through Vocation/);
+    const host = folio.chapters.find((chapter) => chapter.id === second?.id);
+    assert.match(host?.title || "", /^Chapter 2\b/);
+    assert.match((host?.blocks || []).flatMap((block) => block.runs || []).join(" "), /second chapter stays/);
+    assert.equal(folio.chapters.some((chapter) => /Excerpt from Chapter/.test(chapter.title)), false);
+  });
+});
+
+describe("links and pictures", () => {
+  it("unwraps a redirect and refuses a script address", () => {
+    assert.equal(safeHref("https://www.google.com/url?q=http%3A%2F%2Flogeion.uchicago.edu%2F&sa=D&usg=abc"), "http://logeion.uchicago.edu/");
+    assert.equal(safeHref("javascript:alert(1)"), "");
+    assert.equal(safeHref("https://www.google.com/url?q=javascript%3Aalert(1)"), "");
+  });
+
+  it("links only the words the rectangle covers", () => {
+    const glyphs = paintLinks(
+      [
+        {
+          str: "Logeion - many dictionaries in usable format",
+          transform: [11, 0, 0, 11, 108, 64],
+          width: 420,
+          height: 11,
+        },
+      ],
+      [{ x0: 108, y0: 60, x1: 160, y1: 76, href: "https://logeion.uchicago.edu/" }],
+    );
+    const linked = glyphs.filter((glyph) => glyph.href);
+    assert.equal(linked.length, 1);
+    assert.match(linked[0].str, /Logeion/);
+    assert.doesNotMatch(linked[0].str, /dictionaries/);
+    const line = cluster(glyphs)[0];
+    assert.match(line?.spans?.find((span) => span.href)?.text || "", /Logeion/);
+    assert.equal(line?.spans?.some((span) => !span.href && /dictionaries/.test(span.text)), true);
+    const above = paintLinks(
+      [
+        { str: "Beginner vocabulary", transform: [13, 0, 0, 13, 124, 77], width: 160, height: 13 },
+        { str: "Logeion is a dictionary", transform: [11, 0, 0, 11, 108, 64], width: 180, height: 11 },
+      ],
+      [
+        { x0: 124, y0: 73.5, x1: 300, y1: 89, href: "folio:16" },
+        { x0: 108, y0: 60.75, x1: 151, y1: 75, href: "http://logeion.uchicago.edu/" },
+      ],
+    );
+    assert.equal(above.find((glyph) => /Beginner/.test(glyph.str))?.href, "folio:16");
+    assert.equal(above.find((glyph) => /Logeion/.test(glyph.str))?.href, "http://logeion.uchicago.edu/");
+  });
+
+  it("keeps a linked title and a small picture, and drops a repeated running head", () => {
+    const reading = line("Logeion is the first dictionary.", 1, 400, { x0: 72, x1: 420 });
+    reading.spans = [
+      { text: "Logeion", href: "https://logeion.uchicago.edu/" },
+      { text: "is the first dictionary." },
+    ];
+    const picture = line(" ", 1, 260, { x0: 80, x1: 200, h: 120 });
+    picture.plate = { data: "data:image/png;base64,AAAA", w: 48, h: 48 };
+    const folio = assembleFolio([reading, picture], { title: "Links", subtitle: "", sourceName: "links.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const linked = blocks.flatMap((block) => block.runs || []).find((run) => typeof run === "object" && run && "href" in run);
+    assert.equal(linked && "href" in linked ? linked.href : "", "https://logeion.uchicago.edu/");
+    assert.match(linked && "a" in linked ? linked.a : "", /Logeion/);
+    assert.equal(blocks.some((block) => block.t === "img" && block.w === 48), true);
+    const head: ImageUse = { page: 1, x: 20, y: 760, w: 500, h: 30, nativeW: 100, nativeH: 10, pageH: 800 };
+    const icon: ImageUse = { page: 1, x: 80, y: 400, w: 16, h: 16, nativeW: 16, nativeH: 16, pageH: 800 };
+    const images: PdfImage[] = [
+      { w: 100, h: 10, url: "data:image/jpeg;base64,QQ" },
+      { w: 16, h: 16, url: "data:image/png;base64,QQ" },
+    ];
+    const uses = [1, 2, 3, 4, 5].map((page) => ({ ...head, page }));
+    const kept = contentPlates([...uses, icon], images, 5);
+    assert.deepEqual(kept.map((plate) => plate.w), [16]);
+  });
+
+  it("keeps the space between a link and the words beside it", () => {
+    const reading = line("Gaffiot and LaNe mark length.", 1, 400);
+    reading.spans = [
+      { text: "Gaffiot ", href: "https://example.com/gaffiot" },
+      { text: "and " },
+      { text: "LaNe ", href: "https://example.com/lane" },
+      { text: "mark length." },
+    ];
+    const folio = assembleFolio([reading], { title: "Links", subtitle: "", sourceName: "links.pdf", emptyMessage: "empty", skipEpub: true });
+    const text = folio.chapters.flatMap((chapter) => chapter.blocks).flatMap((block) => block.runs || []).map((run) => runText(run)).join("");
+    assert.equal(text, "Gaffiot and LaNe mark length.");
+    const upper = line("Beginner vocabulary lists here", 1, 80);
+    upper.spans = [{ text: "Beginner vocabulary lists here", href: "folio:16" }];
+    const lower = line("Logeion is a dictionary.", 1, 72);
+    lower.spans = [
+      { text: "Logeion ", href: "http://logeion.uchicago.edu/" },
+      { text: "is a dictionary." },
+    ];
+    const joined = assembleFolio([upper, lower], { title: "Links", subtitle: "", sourceName: "links.pdf", emptyMessage: "empty", skipEpub: true });
+    const paras = joined.chapters.flatMap((chapter) => chapter.blocks).filter((block) => block.t === "p").map((block) => (block.runs || []).map((run) => runText(run)).join(""));
+    assert.equal(paras.some((para) => /here Logeion is a dictionary/.test(para)), true);
+  });
+
+  it("reads a jpeg and a compressed gray picture out of a file", () => {
+    const jpeg = Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]);
+    const gray = zlibSync(Uint8Array.of(255));
+    const dict = (body: string, stream: Uint8Array) => {
+      const head = new TextEncoder().encode(`${body}/Length ${stream.length}>>stream\n`);
+      const tail = new TextEncoder().encode("\nendstream endobj\n");
+      const out = new Uint8Array(head.length + stream.length + tail.length);
+      out.set(head);
+      out.set(stream, head.length);
+      out.set(tail, head.length + stream.length);
+      return out;
+    };
+    const a = dict("<</Subtype/Image/Width 1/Height 1/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/DCTDecode", jpeg);
+    const b = dict("<</Subtype/Image/Width 1/Height 1/ColorSpace/DeviceGray/BitsPerComponent 8/Filter/FlateDecode", gray);
+    const file = new Uint8Array(a.length + b.length);
+    file.set(a);
+    file.set(b, a.length);
+    const images = imagesInPdf(file);
+    assert.equal(images.length, 2);
+    assert.match(images[0].url, /^data:image\/jpeg;base64,/);
+    assert.match(images[1].url, /^data:image\/png;base64,/);
+    const packed = epubArchive(
+      {
+        title: "Pictures",
+        subtitle: "",
+        author: "",
+        stats: { hyphensRejoined: 0, headersRemoved: 0, chapters: 1 },
+        toc: [{ id: "c01", label: "Pictures", page: 1, children: [] }],
+        chapters: [
+          {
+            id: "c01",
+            title: "Pictures",
+            page: 1,
+            blocks: [
+              { t: "h1", id: "c01", s: "Pictures", page: 1, src: 1 },
+              { t: "p", runs: [{ a: "Logeion", href: "https://logeion.uchicago.edu/" }, " stays."], page: 1, src: 1 },
+              { t: "img", img: images[0].url, w: 12, page: 1, src: 1 },
+            ],
+          },
+        ],
+      },
+      "pictures.pdf",
+    );
+    const opened = unzipSync(packed);
+    const xhtml = new TextDecoder().decode(opened["OEBPS/text/c01.xhtml"]);
+    assert.match(xhtml, /href="https:\/\/logeion\.uchicago\.edu\/"/);
+    assert.match(xhtml, /src="\.\.\/img\/p1\.jpg"/);
+    assert.ok(opened["OEBPS/img/p1.jpg"]?.length);
+    assert.match(runText({ a: "Logeion", href: "https://logeion.uchicago.edu/" }), /Logeion/);
+  });
+});
+
+describe("verse and columns", () => {
+  it("keeps a printed poem as lines", () => {
+    const rows: [string, number, number, number][] = [
+      ["KABIR'S POEMS", 429, 79, 196],
+      ["I. 13. mo ko kahdn dhinro bande", 387, 52, 227],
+      ["SERVANT, where dost thou", 370, 76, 240],
+      ["seek Me?", 355, 76, 121],
+      ["Lo! I am beside thee.", 340, 40, 152],
+      ["I am neither in temple nor in mosque:", 325, 40, 238],
+      ["I am neither in Kaaba nor in", 310, 64, 242],
+      ["Kailash:", 295, 64, 104],
+      ["Neither am I in rites and ceremonies,", 280, 40, 238],
+      ["nor in Yoga and renunciation.", 266, 63, 216],
+      ["If thou art a true seeker, thou shalt at", 251, 40, 241],
+      ["once see Me: thou shalt meet Me", 236, 63, 239],
+      ["in a moment of time.", 221, 63, 170],
+      ["Kabir says, “O Sadhu! God is the", 207, 40, 240],
+      ["breath of all breath.”", 192, 63, 171],
+    ];
+    const lines = rows.map(([text, y, x0, x1]) => line(text, 53, y, { x0, x1, h: 11, pageW: 317, pageH: 516 }));
+    const folio = assembleFolio(lines, { title: "Kabir", subtitle: "", sourceName: "kabir.pdf", emptyMessage: "empty", skipEpub: true });
+    const texts = folio.chapters.flatMap((chapter) => chapter.blocks).map((block) => (block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    assert.equal(texts.includes("seek Me?"), true);
+    assert.equal(texts.includes("Kailash:"), true);
+    assert.equal(texts.some((text) => text.includes("seek Me?") && text.includes("beside thee")), false);
+    assert.match(folio.warning || "", /verse/);
+    const prose = Array.from({ length: 10 }, (_, n) =>
+      line(`The introduction keeps this full line of prose on the page, sentence ${n}.`, 2, 700 - n * 14, { x0: 76, x1: 280, h: 11, pageW: 317, pageH: 516 }),
+    );
+    const book = assembleFolio(prose, { title: "Prose", subtitle: "", sourceName: "p.pdf", emptyMessage: "empty", skipEpub: true });
+    const joined = book.chapters.flatMap((chapter) => chapter.blocks).map((block) => (block.runs || []).map(runText).join(" ")).join(" ");
+    assert.match(joined, /sentence 0[\s\S]*sentence 3/);
+    assert.doesNotMatch(book.warning || "", /verse/);
+  });
+
+  it("reads a column gutter down the page", () => {
+    const items: { str: string; transform: number[]; width: number; height: number }[] = [];
+    for (let n = 0; n < 8; n++) {
+      const y = 700 - n * 14;
+      // Word spaces of 6pt and a gutter of 12.6pt, as on a 1911 encyclopedia page.
+      const left = [
+        [`Left${n}`, 36, 40],
+        ["sentence", 82, 52],
+        ["stays", 140, 36],
+        ["here", 182, 28],
+      ] as const;
+      const right = [
+        [`Right${n}`, 222.6, 44],
+        ["column", 272.6, 48],
+        ["follows", 326.6, 46],
+        ["after", 378.6, 34],
+      ] as const;
+      for (const [str, x, width] of [...left, ...right]) items.push({ str, transform: [10, 0, 0, 10, x, y], width, height: 10 });
+    }
+    const lines = cluster(items).map((ln) => ({ ...ln, page: 1, pageH: 792, pageW: 560, h: ln.h || 10 }));
+    const folio = assembleFolio(lines, { title: "Columns", subtitle: "", sourceName: "eb.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => (block.runs || []).map(runText).join(" ");
+    const text = blocks.map(textOf).join(" ");
+    assert.ok(text.indexOf("Left0") < text.indexOf("Left7"));
+    assert.ok(text.indexOf("Left7") < text.indexOf("Right0"));
+    assert.equal(blocks.some((block) => textOf(block).includes("here Right0")), false);
+    assert.match(folio.warning || "", /column/);
+  });
+
+  it("keeps a citation from becoming a section", () => {
+    const lines: Line[] = [];
+    for (let n = 0; n < 5; n++) lines.push(line(`The river keeps this full sentence number ${n} in the paragraph.`, 1, 720 - n * 14));
+    lines.push(line("d. Kant. Argau (fine illustrated work on castles), Aarau, 2 vols.,", 1, 620));
+    lines.push(line("E. Zschokke, Geschichte des Aargaus, Aarau, 1903.", 1, 560));
+    for (let n = 0; n < 4; n++) lines.push(line(`The town kept its harbour after that note, sentence ${n}.`, 1, 500 - n * 14));
+    const folio = assembleFolio(lines, { title: "Cite", subtitle: "", sourceName: "c.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const heads = blocks.filter((block) => block.t === "h2").map((block) => block.s || "");
+    assert.equal(heads.some((label) => /Kant|Zschokke/.test(label)), false);
+    const prose = blocks.filter((block) => block.t === "p").map((block) => (block.runs || []).map(runText).join(" ")).join(" ");
+    assert.match(prose, /Kant/);
+    assert.match(prose, /Zschokke/);
+  });
+
+  it("does not drop a hyphen into a fragment from the other column", () => {
+    const items: { str: string; transform: number[]; width: number; height: number }[] = [];
+    for (let n = 0; n < 8; n++) {
+      const y = 700 - n * 14;
+      const left = [
+        [`Left${n}`, 36, 48],
+        ["of", 90, 18],
+        [n === 3 ? "con-" : "words", 114, 127],
+      ] as const;
+      const right =
+        n === 3
+          ? ([["from", 253, 28]] as const)
+          : ([
+              [`Right${n}`, 253, 48],
+              ["column", 307, 50],
+              ["follows", 363, 48],
+              ["after", 417, 36],
+            ] as const);
+      for (const [str, x, width] of [...left, ...right]) items.push({ str, transform: [10, 0, 0, 10, x, y], width, height: 10 });
+    }
+    items.push({ str: "struction", transform: [10, 0, 0, 10, 36, 651], width: 70, height: 10 });
+    const lines = cluster(items).map((ln) => ({ ...ln, page: 1, pageH: 792, pageW: 560, h: ln.h || 10 }));
+    const folio = assembleFolio(lines, { title: "Columns", subtitle: "", sourceName: "eb.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => (block.runs || []).map(runText).join(" ");
+    assert.equal(blocks.some((block) => textOf(block).includes("con- from")), false);
+    assert.match(blocks.map(textOf).join(" "), /construction|con- struction/);
+  });
+
+  it("keeps a lettered plan label in the sentence", () => {
+    const lines: Line[] = [];
+    for (let n = 0; n < 4; n++) lines.push(line(`The abbey kept this sentence of the description ${n}.`, 1, 720 - n * 14));
+    lines.push(line("C. Corridor, with cells on each side. The general appearance of", 1, 620));
+    lines.push(line("A. DEFINITION OF SOUL", 1, 560, { h: 13 }));
+    for (let n = 0; n < 3; n++) lines.push(line(`The cloister stayed in the paragraph after the label ${n}.`, 1, 500 - n * 14));
+    const folio = assembleFolio(lines, { title: "Abbey", subtitle: "", sourceName: "a.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const heads = blocks.filter((block) => block.t === "h2").map((block) => block.s || "");
+    assert.equal(heads.some((label) => /Corridor/.test(label)), false);
+    assert.ok(heads.some((label) => /definition of soul/i.test(label)));
+    const prose = blocks.filter((block) => block.t === "p").map((block) => (block.runs || []).map(runText).join(" ")).join(" ");
+    assert.match(prose, /Corridor/);
+  });
+
+  it("keeps a plate key from becoming sections", () => {
+    const lines: Line[] = [];
+    for (let n = 0; n < 3; n++) lines.push(line(`The plan of the abbey is described in sentence ${n}.`, 1, 720 - n * 14));
+    const keys = [
+      "C. Corridor, with cells on each side.",
+      "D. Staircase.",
+      "O. Sacristy and vestry.",
+      "R. Bakehouse for sacramental",
+    ];
+    keys.forEach((text, n) => lines.push(line(text, 1, 640 - n * 36)));
+    for (let n = 0; n < 3; n++) lines.push(line(`The cloister note stays in the prose ${n}.`, 1, 460 - n * 14));
+    const folio = assembleFolio(lines, { title: "Plan", subtitle: "", sourceName: "plan.pdf", emptyMessage: "empty", skipEpub: true });
+    const heads = folio.chapters.flatMap((chapter) => chapter.blocks).filter((block) => block.t === "h2").map((block) => block.s || "");
+    assert.equal(heads.some((label) => /Bakehouse|Corridor|Sacristy/.test(label)), false);
+  });
+
+  it("reads a nearly full poem line by line", () => {
+    const rows: [string, number][] = [
+      ["makes me to hear the Unstruck", 275],
+      ["Music:", 133],
+      ["He shows joy and sorrow to be one", 264],
+      ["He fills all utterance with love.", 248],
+      ["Kabir says the seeker has no fear", 278],
+      ["who has such a Guru to lead him", 271],
+      ["to the shelter of safety today", 236],
+      ["HE shadows of evening fall thick", 277],
+      ["and deep, and the darkness of love", 270],
+      ["envelops the body and the mind.", 262],
+      ["Open the window to the west now", 278],
+      ["lost in the sky of love", 214],
+      ["Drink the sweet honey of the heart", 274],
+      ["Receive the waves in your body", 268],
+      ["splendour is in the region of the", 255],
+      ["sea!", 121],
+    ];
+    const lines = rows.map(([text, x1], n) => line(text, 80, 420 - n * 14, { x0: 70, x1, h: 11, pageW: 317, pageH: 516 }));
+    const folio = assembleFolio(lines, { title: "Kabir", subtitle: "", sourceName: "kabir.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => ((block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    assert.match(folio.warning || "", /verse/);
+    const music = blocks.find((block) => textOf(block) === "Music:");
+    assert.equal(music ? textOf(music) : "", "Music:");
+    assert.equal(blocks.some((block) => textOf(block).includes("Music:") && textOf(block).includes("He shows")), false);
+  });
+
+  it("keeps a play's speeches apart", () => {
+    const rows: [string, number, number, number][] = [
+      ["Nora. There is a crown. No, keep the change.", 400, 52, 251],
+      ["[The Porter thanks her and goes. Nora shuts the door.", 386, 43, 278],
+      ["She continues smiling as she takes off her outdoor things.]", 372, 61, 220],
+      ["Nora. Yes, he is at home.", 358, 51, 159],
+      ["Helmer (in his room). Is that my lark twittering there?", 344, 51, 277],
+      ["Nora. Just this minute. (Hides the bag of macaroons", 330, 51, 278],
+      ["in her pocket.) Come here, Torvald, and see what I bought.", 316, 41, 200],
+      ["Helmer. Don't interrupt me. (A little later he opens", 302, 51, 277],
+      ["the door and looks in, pen in hand.)", 288, 41, 180],
+      ["Nora. Why, Torvald, surely we can afford to launch", 274, 50, 277],
+      ["out a little now that Christmas is here.", 260, 41, 190],
+      ["Helmer. Come, come; we can't afford to squander.", 246, 50, 260],
+      ["Nora. Oh yes, Torvald, do let us squander a little.", 232, 50, 270],
+      ["Helmer. Nora! Still my little featherbrain.", 218, 50, 240],
+    ];
+    const lines = rows.map(([text, y, x0, x1]) => line(text, 12, y, { x0, x1, h: 7, pageW: 321, pageH: 440 }));
+    const folio = assembleFolio(lines, { title: "Doll", subtitle: "", sourceName: "doll.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => ((block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    const texts = blocks.map(textOf);
+    assert.doesNotMatch(folio.warning || "", /verse/);
+    assert.equal(texts.some((text) => text.includes("[The Porter thanks her")), true);
+    assert.equal(texts.some((text) => text.includes("outdoor things.]")), true);
+    assert.equal(texts.some((text) => text.includes("Hides the bag") && text.includes("in her pocket")), true);
+    assert.equal(texts.some((text) => text.includes("Don't interrupt") && text.includes("pen in hand")), true);
+    assert.equal(texts.some((text) => text.includes("lark twittering") && text.includes("Just this minute")), false);
+    assert.equal(texts.some((text) => text.includes("keep the change") && text.includes("Porter thanks")), false);
+  });
+
+  it("keeps a capital-letter speech with its next line", () => {
+    const rows: [string, number, number, number][] = [
+      ["NORA. There is a crown. No, keep the change.", 400, 52, 251],
+      ["HELMER. Is that my lark twittering there?", 372, 51, 277],
+      ["NORA. Just this minute. Come here, Torvald,", 344, 51, 278],
+      ["and see what I have been buying.", 330, 41, 200],
+      ["HELMER. Don't interrupt me.", 316, 51, 220],
+      ["NORA. Why, Torvald, we can afford it.", 302, 50, 250],
+      ["HELMER. Come, come; we can't afford to squander.", 288, 50, 270],
+      ["NORA. Oh yes, do let us squander a little.", 274, 50, 260],
+      ["HELMER. Nora! Still my little featherbrain.", 260, 50, 240],
+      ["NORA. Yes, he is at home.", 246, 51, 159],
+      ["HELMER. When did the squirrel get home?", 232, 51, 250],
+      ["NORA. Yes!", 218, 51, 99],
+      ["HELMER. Don't interrupt the work.", 204, 51, 230],
+      ["NORA. I only came to show you this.", 190, 50, 240],
+    ];
+    const lines = rows.map(([text, y, x0, x1]) => line(text, 12, y, { x0, x1, h: 7, pageW: 321, pageH: 440 }));
+    const folio = assembleFolio(lines, { title: "Doll", subtitle: "", sourceName: "doll.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => ((block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    const texts = blocks.map(textOf);
+    assert.doesNotMatch(folio.warning || "", /verse/);
+    assert.equal(texts.some((text) => text.includes("Come here, Torvald") && text.includes("been buying")), true);
+    assert.equal(texts.some((text) => text.includes("lark twittering") && text.includes("Just this minute")), false);
+  });
+
+  it("reads a tight poem line by line", () => {
+    const page = { h: 11, pageW: 333, pageH: 527 };
+    const rows: [string, number, number][] = [
+      ["They are angry, for they do not want", 98, 298],
+      ["me to go, and they say she thinks", 122, 299],
+      ["she has gained such dominion", 122, 300],
+      ["over her husband that she wishes", 122, 300],
+      ["and therefore she is impatient", 122, 299],
+      ["to go to him.", 122, 180],
+      ["Dear friend, lift my veil lightly now", 98, 298],
+      ["for this is the night of love.", 122, 265],
+      ["Kabir says my heart is eager", 98, 299],
+      ["to meet my lover on the bed.", 122, 290],
+      ["LXXXVI", 173, 218],
+      ["III. 96. jiv mahal men Siv pahunwa", 98, 297],
+      ["Do not act the part of a madman", 98, 299],
+      ["for the night is thickening fast.", 122, 266],
+      ["He has awaited me for ages", 98, 300],
+      ["and the morning is already here.", 122, 280],
+    ];
+    const lines = rows.map(([text, x0, x1], n) => line(text, 140, 460 - n * 15, { ...page, x0, x1 }));
+    const folio = assembleFolio(lines, { title: "Kabir", subtitle: "", sourceName: "kabir.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => ((block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    assert.match(folio.warning || "", /verse/);
+    assert.equal(blocks.some((block) => textOf(block) === "me to go, and they say she thinks"), true);
+    assert.equal(blocks.some((block) => textOf(block).includes("do not want") && textOf(block).includes("me to go")), false);
+    const prose = Array.from({ length: 14 }, (_, n) =>
+      line(`The introduction keeps this full line of prose on the page, sentence ${n}.`, 2, 700 - n * 14, { x0: 89, x1: 290, h: 11, pageW: 333, pageH: 527 }),
+    );
+    const book = assembleFolio(prose, { title: "Prose", subtitle: "", sourceName: "p.pdf", emptyMessage: "empty", skipEpub: true });
+    const joined = book.chapters.flatMap((chapter) => chapter.blocks).map((block) => (block.runs || []).map(runText).join(" ")).join(" ");
+    assert.match(joined, /sentence 0[\s\S]*sentence 3/);
+    assert.doesNotMatch(book.warning || "", /verse/);
+  });
+
+  it("keeps a contributor with the articles signed", () => {
+    const page = { h: 8, pageW: 553, pageH: 744 };
+    const lines: Line[] = [
+      line("c. F. R. Charles F. Richardson, Ph.D.", 25, 700, { ...page, x0: 12, x1: 460 }),
+      line("Professor of English, Dartmouth College.", 25, 688, { ...page, x0: 93, x1: 460 }),
+      line("c. Pf. Christian Pfister, D. es L. , f", 25, 660, { ...page, x0: 12, x1: 420 }),
+      line("Professor at the Sorbonne, Paris. Author of Alcuin.", 25, 648, { ...page, x0: 93, x1: 450 }),
+    ];
+    const folio = assembleFolio(lines, { title: "Initials", subtitle: "", sourceName: "eb.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => ((block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    const heads = blocks.filter((block) => block.t === "h2").map(textOf);
+    assert.equal(heads.some((label) => /Pfister/.test(label)), false);
+    const prose = blocks.filter((block) => block.t === "p").map(textOf);
+    assert.equal(prose.some((text) => text.includes("Richardson") && text.includes("Dartmouth")), true);
+    assert.equal(prose.some((text) => text.includes("Richardson") && text.includes("Pfister")), false);
+    assert.equal(prose.some((text) => text.includes("Pfister")), true);
+    assert.equal(prose.some((text) => text.includes("Sorbonne")), true);
+  });
+
+  it("does not glue a two-piece line across the gutter", () => {
+    const items: { str: string; transform: number[]; width: number; height: number }[] = [];
+    for (let n = 0; n < 8; n++) {
+      const y = 700 - n * 14;
+      const left =
+        n === 3
+          ? ([["in kind.", 36, 48]] as const)
+          : ([
+              [`Left${n}`, 36, 48],
+              ["sentence", 90, 52],
+              ["stays", 148, 36],
+              ["here", 190, 28],
+            ] as const);
+      const right =
+        n === 3
+          ? ([["known quantity", 300, 90]] as const)
+          : ([
+              [`Right${n}`, 300, 48],
+              ["column", 354, 48],
+              ["follows", 408, 46],
+              ["after", 460, 34],
+            ] as const);
+      for (const [str, x, width] of [...left, ...right]) items.push({ str, transform: [10, 0, 0, 10, x, y], width, height: 10 });
+    }
+    const lines = cluster(items).map((ln) => ({ ...ln, page: 1, pageH: 792, pageW: 560, h: ln.h || 10 }));
+    const folio = assembleFolio(lines, { title: "Columns", subtitle: "", sourceName: "eb.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => (block.runs || []).map(runText).join(" ");
+    assert.equal(blocks.some((block) => textOf(block).includes("kind. known")), false);
+    const text = blocks.map(textOf).join(" ");
+    assert.ok(text.indexOf("in kind.") < text.indexOf("known quantity"));
+    assert.ok(text.indexOf("Left7") < text.indexOf("Right0"));
+  });
+
+  it("splits a tight gutter even when the line has a double period", () => {
+    const items: { str: string; transform: number[]; width: number; height: number }[] = [];
+    for (let n = 0; n < 10; n++) {
+      const y = 680 - n * 13;
+      if (n === 4) {
+        items.push({ str: "by the Zoroastrian eschatology.", transform: [9, 0, 0, 9, 28, y], width: 130, height: 9 });
+        items.push({ str: ". But allegory was far from", transform: [9, 0, 0, 9, 161, y], width: 88, height: 9 });
+        items.push({ str: "more convenient to write", transform: [9, 0, 0, 9, 258, y], width: 120, height: 9 });
+        items.push({ str: "the name", transform: [9, 0, 0, 9, 382, y], width: 52, height: 9 });
+        continue;
+      }
+      let x = 28;
+      for (const [str, width] of [
+        [`Left${n}`, 42],
+        ["sentence", 54],
+        ["stays", 36],
+        ["whole", 40],
+        ["here", 30],
+      ] as const) {
+        items.push({ str, transform: [9, 0, 0, 9, x, y], width, height: 9 });
+        x += width + 3.2;
+      }
+      x = 258;
+      for (const [str, width] of [
+        [`Right${n}`, 48],
+        ["column", 48],
+        ["follows", 48],
+        ["after", 36],
+      ] as const) {
+        items.push({ str, transform: [9, 0, 0, 9, x, y], width, height: 9 });
+        x += width + 3.2;
+      }
+    }
+    const lines = cluster(items).map((ln) => ({ ...ln, page: 1, pageH: 792, pageW: 560, h: ln.h || 9 }));
+    const folio = assembleFolio(lines, { title: "Columns", subtitle: "", sourceName: "eb.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => (block.runs || []).map(runText).join(" ");
+    const text = blocks.map(textOf).join(" ");
+    assert.equal(blocks.some((block) => textOf(block).includes("from more")), false);
+    assert.ok(text.indexOf("eschatology") < text.indexOf("more convenient"));
+    assert.ok(text.indexOf("Left0") < text.indexOf("Right0"));
+  });
+
+  it("starts an encyclopedia entry and a column paragraph on their own", () => {
+    const page = { h: 9, pageW: 545, pageH: 743 };
+    const left: [string, number, number][] = [
+      ["The article before this one keeps its own sentence here.", 12, 250],
+      ["Another full line of that article stays in the column.", 12, 252],
+      ["A third line of the article is still the same paragraph.", 12, 248],
+      ["System der Rechtsphilosophie (Munich, 1904).", 13, 200],
+      ["ABOUKIR, a village on the Mediterranean coast of Egypt,", 21, 250],
+      ["145 m. N.E. of Alexandria by rail, containing a castle.", 13, 248],
+      ["The battle ended there.", 12, 140],
+      ["The next paragraph starts after that short line.", 22, 250],
+      ["It continues on the following line of the column.", 12, 246],
+      ["ABOUT, EDMOND FRANCOIS, the French writer, was born then.", 12, 250],
+    ];
+    const right: [string, number, number][] = [
+      ["Right article opens with a full line of its own here.", 275, 520],
+      ["The right column continues under that opening line.", 275, 518],
+      ["A further sentence keeps the right column together.", 275, 516],
+      ["One more full line belongs to the same right article.", 275, 514],
+      ["Short close.", 275, 340],
+      ["Indented follow up stays with its own paragraph here.", 286, 518],
+      ["And the rest of that paragraph remains beside it.", 275, 510],
+      ["More of the right column is read after the left one.", 275, 514],
+      ["The last right line stays in the right column alone.", 275, 500],
+      ["A final sentence keeps the column from looking short.", 275, 508],
+    ];
+    const lines = [...left, ...right].map(([text, x0, x1], n) =>
+      line(text, 1, 640 - (n % left.length) * 14, { ...page, x0, x1 }),
+    );
+    const folio = assembleFolio(lines, { title: "Entries", subtitle: "", sourceName: "eb.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => (block.runs || []).map(runText).join(" ").replace(/\s+/g, " ");
+    const texts = blocks.map(textOf);
+    assert.equal(texts.some((text) => text.includes("1904") && text.includes("ABOUKIR")), false);
+    assert.equal(texts.some((text) => text.includes("ABOUKIR") && text.includes("Alexandria")), true);
+    assert.equal(texts.some((text) => text.includes("battle ended") && text.includes("next paragraph")), false);
+    assert.equal(texts.some((text) => text.includes("following line") && text.includes("ABOUT")), false);
+    assert.equal(texts.some((text) => text.includes("ABOUT") && text.includes("French writer")), true);
+    assert.equal(texts.some((text) => text.includes("Short close") && text.includes("Indented follow")), false);
+    const text = texts.join(" ");
+    assert.ok(text.indexOf("ABOUKIR") < text.indexOf("Right article"));
+  });
+
+  it("sets body-size footnotes apart at the foot of a column", () => {
+    const page = { h: 9, pageW: 545, pageH: 743 };
+    const rows: [string, number, number, number][] = [
+      ["The myth of the first man stays in the article here.", 13, 250, 620],
+      ["A second line of that article keeps the same column.", 13, 252, 606],
+      ["A third line is still the body of the article itself.", 13, 248, 592],
+      ["sacred mountain, see Cosmogony.", 13, 160, 578],
+      ["1 Note the food and drink of the gods in the story.", 21, 250, 160],
+      ["(or Adamu?) myth.", 14, 100, 146],
+      ["4 See Cheyne, Genesis and Exodus.", 21, 200, 132],
+      ["To these illustrations it is unsafe to add a scene.", 275, 520, 620],
+      ["preserved in the museum, representing two figures.", 275, 518, 606],
+      ["A third right line keeps the article above the notes.", 275, 516, 592],
+      ["The scene was never found in the museum records.", 275, 500, 578],
+      ["6 See Jastrow, Rel. of Bab. and Ass. the citation.", 283, 520, 160],
+      ["7 The wisdom was probably to qualify him as ruler.", 283, 510, 146],
+    ];
+    const lines = rows.map(([text, x0, x1, y]) => line(text, 1, y, { ...page, x0, x1 }));
+    const folio = assembleFolio(lines, { title: "Notes", subtitle: "", sourceName: "eb.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => (block.runs || []).map(runText).join(" ").replace(/\s+/g, " ");
+    assert.match(folio.warning || "", /Notes/);
+    assert.equal(blocks.some((block) => textOf(block).includes("illustrations") && textOf(block).includes("Jastrow")), false);
+    assert.equal(blocks.some((block) => textOf(block).includes("Cosmogony") && textOf(block).includes("Note the food")), false);
+    const food = blocks.find((block) => textOf(block).includes("Note the food"));
+    assert.equal(food?.kind, "note");
+    assert.match(textOf(food!), /Adamu/);
+    assert.doesNotMatch(textOf(food!), /Cheyne/);
+    const cited = blocks.find((block) => textOf(block).includes("Jastrow"));
+    assert.equal(cited?.kind, "note");
+    const alone = [
+      line("A numbered remark stays in the article itself.", 2, 600, { ...page, x0: 13, x1: 250 }),
+      line("The second line of that article is still prose.", 2, 586, { ...page, x0: 13, x1: 250 }),
+      line("The third line of that article is still prose.", 2, 572, { ...page, x0: 13, x1: 250 }),
+      line("The fourth line of that article is still prose.", 2, 558, { ...page, x0: 13, x1: 248 }),
+      line("1 He continued the article rather than a footnote here.", 2, 150, { ...page, x0: 13, x1: 250 }),
+      line("Right column keeps this sentence in the article.", 2, 600, { ...page, x0: 275, x1: 520 }),
+      line("The right column continues with ordinary prose.", 2, 586, { ...page, x0: 275, x1: 518 }),
+      line("Another right line is still part of the article.", 2, 572, { ...page, x0: 275, x1: 516 }),
+      line("The last right line closes the article in prose.", 2, 558, { ...page, x0: 275, x1: 510 }),
+    ];
+    const book = assembleFolio(alone, { title: "List", subtitle: "", sourceName: "p.pdf", emptyMessage: "empty", skipEpub: true });
+    const prose = book.chapters.flatMap((chapter) => chapter.blocks);
+    const one = prose.find((block) => textOf(block).includes("He continued"));
+    assert.notEqual(one?.kind, "note");
+    assert.doesNotMatch(book.warning || "", /Notes/);
+  });
+
+  it("reads a page of talk as prose, not as a poem", () => {
+    const page = { h: 9, pageW: 307, pageH: 488 };
+    const rows: [string, number, number][] = [
+      ["it would have been she, and that his marriage might have", 35, 287],
+      ["changed his whole life, but now it is too late.", 35, 190],
+      ["When we were taking coffee I told them the story", 48, 287],
+      ["of the treasure which we had brought into the house", 35, 287],
+      ["on that particular night.", 35, 160],
+      ["Mary and Arthur were much interested to hear it", 35, 287],
+      ["but I thought it better not to disturb it.", 35, 188],
+      ["He followed me to my room that night after dinner", 35, 287],
+      ["and asked me for the money.", 35, 168],
+      ["I told him I had already been far too generous", 35, 287],
+      ["with him for many years.", 35, 160],
+      ["The next morning the coronet was gone from its case", 35, 287],
+      ["and the household was in an uproar.", 35, 176],
+      ["Holmes listened and did not interrupt the account", 35, 287],
+      ["until the whole miserable story was told to him", 35, 287],
+      ["before anyone else had touched the room.", 35, 184],
+    ];
+    const lines = rows.map(([text, x0, x1], n) => line(text, 1, 460 - n * 13, { ...page, x0, x1 }));
+    const folio = assembleFolio(lines, { title: "Holmes", subtitle: "", sourceName: "holmes.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => (block.runs || []).map(runText).join(" ").replace(/\s+/g, " ");
+    assert.doesNotMatch(folio.warning || "", /verse/);
+    assert.equal(blocks.some((block) => textOf(block).includes("might have") && textOf(block).includes("changed his whole")), true);
+    assert.equal(blocks.some((block) => textOf(block).includes("too late") && textOf(block).includes("taking coffee")), false);
+  });
+
+  it("opens a column break when only some lines cross it", () => {
+    const page = { h: 9, pageW: 545, pageH: 743 };
+    const lines: Line[] = [];
+    for (let n = 0; n < 16; n++) {
+      lines.push(line(`Left column keeps sentence ${n} on its own side.`, 1, 680 - n * 12, { ...page, x0: 13, x1: 248 }));
+      lines.push(line(`Right column keeps sentence ${n} on its own side.`, 1, 680 - n * 12, { ...page, x0: 275, x1: 510 }));
+    }
+    for (let n = 0; n < 12; n++) {
+      const left = n === 3 ? "stretching down to and even across the" : `Left crossing line ${n} stays here`;
+      const right = n === 3 ? "position above the chapter house" : `Right crossing line ${n} stays here`;
+      lines.push({
+        text: `${left} ${right}`,
+        y: 640 - n * 12,
+        x0: 13,
+        x1: 520,
+        h: 9,
+        page: 1,
+        pageH: 743,
+        pageW: 545,
+        seams: [{ x0: 250, x1: 274, left, right, leftX0: 13, leftX1: 248, rightX0: 275, rightX1: 520 }],
+      });
+    }
+    const folio = assembleFolio(lines, { title: "Abbey", subtitle: "", sourceName: "eb.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => (block.runs || []).map(runText).join(" ");
+    assert.match(folio.warning || "", /column/);
+    assert.equal(blocks.some((block) => textOf(block).includes("across the position")), false);
+    const text = blocks.map(textOf).join(" ");
+    assert.ok(text.indexOf("across the") < text.indexOf("position above"));
+  });
+
+  it("does not make a line that already holds a sentence into a heading", () => {
+    const lines: Line[] = [
+      line("Past President of Architectural Association. Associate and Fellow of King's", 1, 500),
+      line("College, London. Editor of the history of the building.", 1, 486),
+      line("The article continues in ordinary prose after that note.", 1, 460),
+    ];
+    const folio = assembleFolio(lines, { title: "Initials", subtitle: "", sourceName: "eb.pdf", emptyMessage: "empty", skipEpub: true });
+    const heads = folio.chapters.flatMap((chapter) => chapter.blocks).filter((block) => block.t === "h2").map((block) => block.s || "");
+    assert.equal(heads.some((label) => /President|College/.test(label)), false);
+  });
+
+  it("reads a typed letter as prose and keeps a buried name in the sentence", () => {
+    const page = { h: 12, pageW: 627, pageH: 792 };
+    const rows: [string, number, number, number][] = [
+      ["The North Nassau Mental Health Center", 103, 513, 740],
+      ["May 9, 1968", 384, 463, 700],
+      ["Professor Linus Pauling", 112, 274, 660],
+      ["La Jolla, California 92037", 113, 299, 632],
+      ["Dear Professor Pauling:", 112, 280, 600],
+      ["As one of the psychiatrist who has been using ortho-", 150, 525, 560],
+      ["molecular psychiatry for several years in the field of", 112, 520, 546],
+      ["schizophrenia, I greatly enjoyed your article in the April", 112, 533, 532],
+      ["19th issue of Science. I would like to obtain reprints", 112, 522, 518],
+      ["for the Staff so that I could use twenty reprints if they are", 112, 540, 504],
+      ["Thomas, and yon - and perhaps Dr. Cameron - will come too.", 112, 530, 490],
+      ["available.", 112, 180, 476],
+      ["Please bill us for the costs involved.", 150, 430, 430],
+      ["Sincerely,", 360, 450, 220],
+      ["Linus Pauling", 250, 380, 180],
+    ];
+    const lines = rows.map(([text, x0, x1, y]) => line(text, 1, y, { ...page, x0, x1 }));
+    const folio = assembleFolio(lines, { title: "Letter", subtitle: "", sourceName: "letter.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => ((block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    const heads = blocks.filter((block) => block.t === "h2").map(textOf);
+    assert.doesNotMatch(folio.warning || "", /verse/);
+    assert.equal(heads.some((label) => /92037|California|Pauling/.test(label)), false);
+    const body = blocks.map(textOf).find((text) => text.includes("molecular"));
+    assert.match(body || "", /ortho- molecular|orthomolecular/);
+    assert.match(body || "", /Dr\. Cameron/);
+    assert.doesNotMatch(body || "", /Please bill/);
+  });
+
+  it("joins a typewriter line whose word boxes overlap", () => {
+    const y = 472;
+    const items = [
+      ["Under separate cover I", 125, 147],
+      ["am sending you", 265, 93],
+      ["the", 365, 20],
+      ["twenty reprints", 391, 100],
+      ["of my paper", 478, 71],
+    ].map(([str, x, width]) => ({ str: String(str), transform: [10, 0, 0, 10, Number(x), y], width: Number(width), height: 10 }));
+    const lines = cluster(items);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].text, "Under separate cover I am sending you the twenty reprints of my paper");
+  });
+
+  it("keeps a transcript speech with its speaker", () => {
+    const page = { h: 12, pageW: 630, pageH: 794 };
+    const rows: [string, number, number, number][] = [
+      ["NOT FOR WOMEN ONLY", 250, 420, 740],
+      ["BARBARA WALTERS: I'm Barbara Walters and welcome to our program today.", 139, 560, 700],
+      ["all this week we are discussing vitamins and what they do for you.", 100, 546, 686],
+      ["what specific good or harm do they do you on this show today.", 101, 545, 672],
+      ["yesterday we were talking about vitamin C and whether it prevents colds.", 101, 560, 658],
+      ["the man who leads that work is here with the rest of the panel.", 100, 540, 644],
+      ["MS WALTERS; Physical chemist, all right. Dr. Linus Pauling is here.", 136, 560, 600],
+      ["Pauling is a physical chemist and one of America's foremost scientists.", 98, 560, 586],
+      ["DR PAULING; Well there is no doubt that it helps preserve the vessels.", 140, 580, 540],
+      ["the evidence is especially good for the peripheral arteries of the body.", 102, 580, 526],
+    ];
+    const lines = rows.map(([text, x0, x1, y]) => line(text, 1, y, { ...page, x0, x1 }));
+    const folio = assembleFolio(lines, { title: "Show", subtitle: "", sourceName: "show.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => (block.runs || []).map(runText).join(" ").replace(/\s+/g, " ");
+    assert.doesNotMatch(folio.warning || "", /verse/);
+    assert.equal(blocks.some((block) => textOf(block).includes("welcome to our") && textOf(block).includes("all this week")), true);
+    assert.equal(blocks.some((block) => textOf(block).includes("Physical chemist") && textOf(block).includes("foremost scientists")), true);
+    assert.equal(blocks.some((block) => textOf(block).includes("Physical chemist") && textOf(block).includes("DR PAULING")), false);
+    assert.equal(blocks.some((block) => textOf(block).includes("no doubt") && textOf(block).includes("peripheral arteries")), true);
+  });
+
+  it("keeps an itinerary day and reads the clock across the row", () => {
+    const page = { h: 11, pageW: 624, pageH: 791 };
+    const row = (left: string, right: string, y: number): Line => ({
+      text: `${left} ${right}`,
+      y,
+      x0: 40,
+      x1: 560,
+      h: 11,
+      page: 1,
+      pageH: 791,
+      pageW: 624,
+      cells: [
+        { text: left, x0: 40, x1: 280 },
+        { text: right, x0: 360, x1: 560 },
+      ],
+    });
+    const lines: Line[] = [
+      line("Thursday - March 7", 1, 700, page),
+      line("Monday - March 11", 1, 680, page),
+      line("Tuesday - March 12", 1, 660, page),
+      line("Wednesday - March 13", 1, 640, page),
+      row("Leave SF 8:45 a.m.", "United F1 #50", 600),
+      row("Arrive Washington 4:40 p.m.", "Hilton Hotel", 580),
+      row("Meeting at Sloan-Kettering", "2:00 to 4:00 p.m.", 540),
+      row("Leave LaGuardia", "11:40 a.m.", 500),
+      line("Friday - March 15", 1, 460, page),
+    ];
+    const folio = assembleFolio(lines, { title: "Trip", subtitle: "", sourceName: "trip.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => {
+      if (block.t === "table") return `TABLE ${(block.headers || []).join(" ")} ${(block.rows || []).flat().join(" ")}`;
+      return (block.runs || []).map(runText).join(" ");
+    };
+    const text = blocks.map(textOf).join(" ");
+    assert.doesNotMatch(folio.warning || "", /column|table/);
+    assert.match(text, /Thursday - March 7/);
+    assert.match(text, /Wednesday - March 13/);
+    assert.match(text, /Friday - March 15/);
+    assert.match(text, /LaGuardia/);
+    assert.match(text, /11:40/);
+    assert.match(text, /#50/);
+    assert.equal(contentsEntry({ text: "Thursday - March 7" }), null);
+    assert.equal(contentsEntry({ text: "April 12, 1972" }), null);
+    const listed = contentsEntry({ text: "Sunday, March 3 .... 12" });
+    assert.equal(listed?.token, "12");
+    assert.match(listed?.title || "", /Sunday, March 3/);
+  });
+
+  it("does not make a column of stray letters into a table", () => {
+    const cells = (texts: string[], y: number): Line => ({
+      text: texts.join(" "),
+      y,
+      x0: 80,
+      x1: 560,
+      h: 11,
+      page: 1,
+      pageH: 792,
+      pageW: 624,
+      cells: texts.map((text, index) => ({ text, x0: index === 0 ? 80 : 540, x1: index === 0 ? 500 : 560 })),
+    });
+    const lines: Line[] = [
+      line("OFFICE MEMORANDUM", 1, 740, { x0: 80, x1: 400 }),
+      cells(["I do not have any information beyond that given in the letter from him.", "z"], 640),
+      cells(["Dr. Hawkins discussed this matter with the school when he was here today.", "o"], 626),
+      cells(["The impression was of a considerable number of people on that program.", "c"], 612),
+    ];
+    const folio = assembleFolio(lines, { title: "Memo", subtitle: "", sourceName: "memo.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    assert.equal(blocks.some((block) => block.t === "table"), false);
+    const text = blocks.flatMap((block) => block.runs || []).map(runText).join(" ");
+    assert.match(text, /considerable number/);
+  });
+
+  it("reads a centered typewritten section as a heading", () => {
+    const page = { h: 12, pageW: 612, pageH: 792 };
+    const body = [
+      "Since late 1966, our research friends have been trying to collect clinical",
+      "impressions of what can be seen subjectively and described by a physician.",
+      "Another full line of this report stays with the paragraph above it here.",
+      "And one more line keeps the page from looking like a short note today.",
+      "The next sentence of the report continues in the same typewritten measure.",
+      "A further line of ordinary prose belongs to that same opening paragraph.",
+    ];
+    const lines: Line[] = [
+      line("THE B-3 THERAPY", 5, 760, { ...page, x0: 230, x1: 390 }),
+      line("PROMISING EVENTS IN THE B-3 FIELD (1966-1967)", 5, 680, { ...page, x0: 70, x1: 540 }),
+      ...body.map((text, n) => line(text, 5, 640 - n * 14, { ...page, x0: 72, x1: n === 1 ? 500 : 548 })),
+    ];
+    const folio = assembleFolio(lines, { title: "B-3", subtitle: "", sourceName: "b3.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => ((block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    const heads = blocks.filter((block) => block.t === "h2").map(textOf);
+    assert.equal(heads.some((label) => /B-3 Therapy/.test(label)), false);
+    assert.equal(heads.some((label) => /Promising Events/.test(label) && /1966/.test(label)), true);
+    assert.equal(blocks.some((block) => textOf(block).includes("Since late") && textOf(block).includes("impressions of")), true);
+    assert.equal(blocks.some((block) => textOf(block).includes("Promising") && textOf(block).includes("Since late")), false);
+  });
+
+  it("reads a topical index whose pages are ranges", () => {
+    const page = { h: 12, pageW: 612, pageH: 792 };
+    const lines: Line[] = [
+      line("TOPICAL INDEX", 1, 700, { ...page, x0: 230, x1: 390 }),
+      line("1. Expansion of B-3 Therapy, 1966-67 . . . . . 1 – 2", 1, 660, { ...page, x0: 72, x1: 540 }),
+      line("2. Promising Events In the B-3 Field – 1966-67 . . . . 3 – 5", 1, 640, { ...page, x0: 72, x1: 540 }),
+      line("3. Safety, Dosage and Side Effects . . . . . . . . 6 – 9", 1, 620, { ...page, x0: 72, x1: 540 }),
+      line("4. Alcoholism – Report of Dr. Russell Smith", 1, 600, { ...page, x0: 72, x1: 480 }),
+      line("507 cases. (Brighton Hospital, Detroit;", 1, 584, { ...page, x0: 96, x1: 420 }),
+      line("Guest House, Lake Orion, Mich.) . . . . . . 10 – 13", 1, 568, { ...page, x0: 96, x1: 540 }),
+    ];
+    const prose = [
+      "Since late 1966, our research friends have been trying to collect clinical",
+      "impressions of what can be seen subjectively and described by a physician.",
+      "Another full line of this report stays with the paragraph above it here.",
+      "And one more line keeps the page from looking like a short note today.",
+    ];
+    for (let n = 1; n <= 13; n++) {
+      const file = n + 1;
+      lines.push(line("THE B-3 THERAPY", file, 760, { ...page, x0: 230, x1: 390 }));
+      lines.push(line(`- ${n} -`, file, 24, { ...page, x0: 280, x1: 330 }));
+      if (n === 3) lines.push(line("PROMISING EVENTS IN THE B-3 FIELD (1966-1967)", file, 680, { ...page, x0: 70, x1: 540 }));
+      if (n === 6) lines.push(line("SAFETY - DOSAGE - SIDE EFFECTS", file, 680, { ...page, x0: 120, x1: 490 }));
+      if (n === 1 || n === 3 || n === 6 || n === 10) prose.forEach((text, index) => lines.push(line(text, file, 640 - index * 16, { ...page, x0: 72, x1: 540 })));
+    }
+    const ranged = contentsEntry({ text: "1. Expansion of B-3 Therapy, 1966-67 . . . . . 1 – 2" });
+    assert.equal(ranged?.token, "1");
+    assert.match(ranged?.title || "", /Expansion of B-3 Therapy, 1966-67/);
+    assert.doesNotMatch(ranged?.title || "", /1 – 2|1-2/);
+    assert.equal(contentsEntry({ text: "3. Safety, Dosage and Side Effects .... 6-9" })?.token, "6");
+    assert.equal(contentsEntry({ text: "Thursday - March 7" }), null);
+    const folio = assembleFolio(lines, { title: "B-3", subtitle: "", sourceName: "b3.pdf", emptyMessage: "empty", skipEpub: true });
+    const labels = folio.toc.map((item) => `${item.label} @${item.page}`);
+    assert.ok(labels.some((label) => /Expansion of B-3 Therapy/.test(label) && /@1$/.test(label)));
+    assert.ok(labels.some((label) => /Promising Events/.test(label) && /@3$/.test(label)));
+    assert.ok(labels.some((label) => /Safety, Dosage and Side Effects/.test(label) && /@6$/.test(label)));
+    assert.ok(labels.some((label) => /Alcoholism/.test(label) && /Guest House/.test(label) && /@10$/.test(label)));
+    assert.equal(labels.some((label) => /THE B-3 THERAPY|B-3 Therapy @/.test(label)), false);
+    assert.doesNotMatch(folio.warning || "", /verse/);
+    const reading = folio.chapters.flatMap((chapter) => chapter.blocks).map((block) => block.s || (block.runs || []).map(runText).join(" ")).join(" ");
+    assert.match(reading, /Since late 1966/);
+    assert.doesNotMatch(reading, /1 – 2/);
+  });
+
+  it("reads a study guide's questions as prose and keeps the next section", () => {
+    const page = { h: 12, pageW: 612, pageH: 792 };
+    const lines: Line[] = [
+      line("Power vs. Force", 1, 760, { ...page, x0: 72, x1: 190 }),
+      line("18", 1, 760, { ...page, x0: 540, x1: 558 }),
+      line("Chapter Six", 1, 710, { ...page, x0: 250, x1: 370 }),
+      line("Section I", 1, 688, { ...page, x0: 270, x1: 350 }),
+      line("1. Why is the critical point of integrity at 200 so", 1, 650, { ...page, x0: 72, x1: 470 }),
+      line("important to the rest of this study?", 1, 634, { ...page, x0: 72, x1: 300 }),
+      line("2. What is the basic principle?", 1, 600, { ...page, x0: 72, x1: 250 }),
+      line("3. How does power differ from force in the world?", 1, 572, { ...page, x0: 72, x1: 430 }),
+      line("4. What does calibration measure?", 1, 544, { ...page, x0: 72, x1: 290 }),
+      line("Section II", 1, 500, { ...page, x0: 72, x1: 160 }),
+      line("5. Where does integrity begin?", 1, 468, { ...page, x0: 72, x1: 260 }),
+      line("6. What is the role of context?", 1, 440, { ...page, x0: 72, x1: 280 }),
+      line("7. How is truth recognized by the reader?", 1, 412, { ...page, x0: 72, x1: 370 }),
+      line("8. What follows from willingness?", 1, 384, { ...page, x0: 72, x1: 280 }),
+    ];
+    const folio = assembleFolio(lines, { title: "Guide", subtitle: "", sourceName: "guide.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => ((block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    const labels = folio.toc.map((item) => item.label);
+    assert.equal(labels.some((label) => /Why is the critical point/.test(label)), false);
+    assert.match(labels.join(" "), /Chapter Six/);
+    assert.equal(blocks.some((block) => block.t === "h2" && /Section I/.test(textOf(block))), true);
+    assert.equal(blocks.some((block) => block.t === "h2" && /Section II/.test(textOf(block))), true);
+    const body = blocks.filter((block) => block.t === "p").map(textOf);
+    assert.equal(body.some((text) => /critical point of integrity/.test(text) && /rest of this study/.test(text)), true);
+    assert.equal(body.some((text) => /critical point/.test(text) && /basic principle/.test(text)), false);
+    assert.equal(body.filter((text) => /^\d+\./.test(text)).length, 8);
+    assert.doesNotMatch(folio.warning || "", /verse/);
+  });
+
+  it("keeps an interview question apart from its answer", () => {
+    const page = { h: 12, pageW: 612, pageH: 792 };
+    const lines: Line[] = [];
+    for (let n = 0; n < 4; n++) {
+      lines.push(line(`Q. Left question ${n} about the meaning of power?`, 1, 700 - n * 48, { ...page, x0: 40, x1: 270 }));
+      lines.push(line(`A. Left answer ${n} stays on this side of the sheet.`, 1, 684 - n * 48, { ...page, x0: 40, x1: 280 }));
+      lines.push(line(`Q. Right question ${n} about the meaning of force?`, 1, 698 - n * 48, { ...page, x0: 340, x1: 570 }));
+      lines.push(line(`A. Right answer ${n} stays on the other side of the sheet.`, 1, 682 - n * 48, { ...page, x0: 340, x1: 580 }));
+    }
+    const folio = assembleFolio(lines, { title: "Interview", subtitle: "", sourceName: "interview.pdf", emptyMessage: "empty", skipEpub: true });
+    const blocks = folio.chapters.flatMap((chapter) => chapter.blocks);
+    const textOf = (block: (typeof blocks)[number]) => ((block.s || (block.runs || []).map(runText).join(" ")).replace(/\s+/g, " ").trim());
+    const reading = blocks.map(textOf).join(" ");
+    assert.ok(reading.indexOf("Left question 0") < reading.indexOf("Left question 3"));
+    assert.ok(reading.indexOf("Left question 3") < reading.indexOf("Right question 0"));
+    assert.equal(blocks.some((block) => /Left question 0/.test(textOf(block)) && /Left answer 0/.test(textOf(block))), false);
+    assert.doesNotMatch(folio.warning || "", /verse/);
+    assert.match(folio.warning || "", /column/);
+  });
+});
+
 

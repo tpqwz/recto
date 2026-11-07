@@ -228,6 +228,11 @@ function headingEdit(token: string, list: WordList) {
   }
   if (hits.size !== 1) return null;
   const fixed = [...hits][0];
+  // A three-letter name is one step from some other word. Only a function word is worth that.
+  if (lower.length < 4 && !STOP.has(fixed)) return null;
+  const titleCase = token[0] === token[0].toUpperCase() && token.slice(1) === lower.slice(1) && token !== token.toUpperCase();
+  // "Tavi" and "Corab" are names. A long title-case token one OCR step from a single word is a scan.
+  if (titleCase && !STOP.has(fixed) && lower.length < 6) return null;
   if (token === token.toLowerCase()) return fixed;
   if (token === token.toUpperCase()) return fixed.toUpperCase();
   if (token[0] === token[0].toUpperCase() && token.slice(1) === lower.slice(1)) return fixed[0].toUpperCase() + fixed.slice(1);
@@ -253,6 +258,20 @@ export function headingStep(from: string, to: string) {
     if (!(STEP_ALT[a[i]] || "").includes(b[i])) return false;
   }
   return diffs === 1;
+}
+
+/** The contents spelling and the heading differ only by letters a scan confuses, as c and e. */
+export function confusableTwin(from: string, to: string) {
+  const a = from.toLowerCase().replace(/[^a-z]/g, "");
+  const b = to.toLowerCase().replace(/[^a-z]/g, "");
+  if (a.length < 5 || a.length !== b.length || a === b) return false;
+  let diffs = 0;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === b[i]) continue;
+    diffs += 1;
+    if (!(CONFUSABLE[a[i]] || "").includes(b[i]) && !(CONFUSABLE[b[i]] || "").includes(a[i])) return false;
+  }
+  return diffs > 0;
 }
 
 function oneEdit(token: string, list: WordList) {

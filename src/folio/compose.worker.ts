@@ -11,6 +11,7 @@ type Job = {
   outline?: OutlineItem[];
   emptyMessage: string;
   lexiconPrefix: string;
+  corrections?: boolean;
   cover?: string;
 };
 
@@ -21,7 +22,7 @@ self.onmessage = (event: MessageEvent<Job>) => {
 
 async function finish(job: Job) {
   try {
-    const lexicon = await loadLexicon(job.lexiconPrefix);
+    const lexicon = job.corrections ? await loadLexicon(job.lexiconPrefix) : null;
     const folio = assembleFolio(job.lines, {
       title: job.title,
       subtitle: job.subtitle,

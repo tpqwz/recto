@@ -3,6 +3,7 @@ import { cluster, type Folio, type Line, type OutlineItem } from "./assemble";
 import { composeFolio } from "./compose";
 import { jpegFromRgba } from "./cover";
 import { DEFAULT_SETTINGS, type DeskSettings } from "./settings";
+import { looksDoubtful } from "./script";
 import { checkpoint } from "./job";
 
 const NO_TEXT = "No text layer in that DjVu. Recto reads the hidden text, not a picture of the page.";
@@ -164,11 +165,28 @@ export async function folioFromDjvu(
       sourceName: filename,
       outline,
       lexiconPrefix: previewPathPrefix(window.location.hostname, window.location.pathname) ?? "",
+      corrections: settings.corrections === true,
       cover,
       emptyMessage: settings.pictures === "empty" ? NO_TEXT_PICTURES : NO_TEXT,
       onStatus,
     });
     folio.origin = { name: filename, kind: "djvu" };
+    if (!settings.corrections) folio.plain = true;
+    if (settings.review) {
+      const by = new Map<number, string[]>();
+      for (const line of lines) {
+        const list = by.get(line.page);
+        if (list) list.push(line.text);
+        else by.set(line.page, [line.text]);
+      }
+      const doubt: { page: number; sample: string }[] = [];
+      for (const [page, parts] of by) {
+        const text = parts.join(" ");
+        if (!looksDoubtful(text)) continue;
+        doubt.push({ page, sample: text.replace(/\s+/g, " ").trim().slice(0, 320) });
+      }
+      if (doubt.length) folio.doubt = doubt;
+    }
     return folio;
   } finally {
     worker.terminate();

@@ -10,12 +10,16 @@ export type DeskSettings = {
   keepFile: boolean;
   /** Picture readers that are on. English starts on. The others start off. */
   scripts: ReaderScript[];
+  /** Rewrite a scan's letters. Off leaves the text layer as printed. */
+  corrections: boolean;
+  /** Ask before a doubtful page is kept or corrected. Off never asks. */
+  review: boolean;
 };
 
 const EXTRA_IDS = SCRIPT_CHOICES.map((choice) => choice.id);
 const SCRIPT_IDS = new Set<ReaderScript>(["en", ...EXTRA_IDS]);
 
-export const DEFAULT_SETTINGS: DeskSettings = { pictures: "empty", kind: "pp", keepFile: false, scripts: ["en"] };
+export const DEFAULT_SETTINGS: DeskSettings = { pictures: "empty", kind: "pp", keepFile: false, scripts: ["en"], corrections: false, review: false };
 
 function chosenScripts(value: unknown): ReaderScript[] {
   if (!Array.isArray(value)) return [];
@@ -47,6 +51,8 @@ export function parseSettings(raw: string | null): DeskSettings {
       kind: value.kind === "vision" ? "vision" : "pp",
       keepFile: value.keepFile === true,
       scripts: value.readers === 4 ? picked : withEnglish(picked),
+      corrections: value.corrections === true,
+      review: value.review === true,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -63,5 +69,5 @@ export function loadSettings(): DeskSettings {
 }
 
 export function saveSettings(settings: DeskSettings) {
-  localStorage.setItem(KEY, JSON.stringify({ pictures: settings.pictures, kind: settings.kind, keepFile: settings.keepFile === true, scripts: settings.scripts, readers: 4 }));
+  localStorage.setItem(KEY, JSON.stringify({ pictures: settings.pictures, kind: settings.kind, keepFile: settings.keepFile === true, scripts: settings.scripts, corrections: settings.corrections === true, review: settings.review === true, readers: 4 }));
 }

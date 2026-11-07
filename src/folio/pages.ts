@@ -88,6 +88,9 @@ function candidates(text: string): Cand[] {
   const splitTail = t.match(/(\d)\s+(\d{2,3})$/);
   const split = splitLead || (splitTail != null && (splitTail.index ?? 0) > 0 ? splitTail : null);
   if (split) add(split[1] + split[2], 2, true);
+  // "- 3 -" and "-3-" are the printed folio. The dashes are not part of a word.
+  const wrapped = t.match(/^[-\u2013\u2014.\s]+(\d{1,4}|[ivxlcdm]{1,8})[-\u2013\u2014.\s]+$/i);
+  if (wrapped) add(wrapped[1], 3, true);
   add(t, 3, true);
   const parts = t.split(/\s+/);
   if (parts.length > 1 && !slash && !pageWord) {
